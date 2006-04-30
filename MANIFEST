@@ -1,0 +1,11 @@
+Changes
+Compare.xs
+engine.c
+engine.h
+Makefile.PL
+MANIFEST
+ppport.h
+README
+t/Regexp-Compare.t
+lib/Regexp/Compare.pm
+META.yml                                 Module meta-data (added by MakeMaker)

@@ -1,0 +1,30 @@
+Regexp-Compare version 0.01
+===========================
+
+This module implements a function comparing regular expressions: it
+returns true if all strings matched by the first regexp are also
+matched by the second. It's meant to be used for optimization of
+blacklists implemented by regular expressions (like, for example,
+http://www.communitywiki.org/cw/BannedContent ).
+
+INSTALLATION
+
+To install this module type the following:
+
+   perl Makefile.PL
+   make
+   make test
+   make install
+
+DEPENDENCIES
+
+This is an XS module, whose compilation requires a C compiler. It
+hasn't been tested on platforms other than Linux.
+
+COPYRIGHT AND LICENCE
+
+Copyright (C) 2006 by Vaclav Barta
+
+This library is free software; you can redistribute it and/or modify
+it under the same terms as Perl itself, either Perl version 5.8.7 or,
+at your option, any later version of Perl 5 you may have available.
