@@ -9,7 +9,10 @@ extern char *rc_error;
 
 void rc_init();
 
+/* might croak but never returns null */
 regexp *rc_regcomp(char *rs);
+
+void rc_regfree(void *rx);
 
 int rc_compare(regnode *p1, regnode *p2);
 

@@ -163,6 +163,28 @@ static int ensure_offset(regnode *p)
     return 1;
 }
 
+static regnode *alloc_alt(regnode *p, int sz)
+{
+    regnode *alt;
+
+    alt = (regnode *)malloc(sizeof(regnode) * sz);
+    if (!alt)
+    {
+	rc_error = "Could not allocate memory for regexp copy";
+	return 0;
+    }
+
+    memcpy(alt, p, sizeof(regnode) * sz);
+
+    if (ensure_offset(alt) <= 0)
+    {
+        free(alt);
+	return 0;
+    }
+
+    return alt;
+}
+
 static int bump_exact(Arrow *a)
 {
     assert((a->rn->type == EXACT) || (a->rn->type == EXACTF));
@@ -225,13 +247,16 @@ static int bump_with_check(Arrow *a)
     }
 }
 
-/* FIXME: pregcomp can croak (i.e. on '[a'), which the caller doesn't
-   handle (leaks resources) */
 regexp *rc_regcomp(char *rs)
 {
     PMOP *pm;
+    char *end;
+    regexp *rx;
 
-    assert(rs);
+    if (!rs)
+    {
+	croak("No regexp to compare");
+    }
 
     Newz(1, pm, 1, PMOP);
     if (pm == 0)
@@ -240,8 +265,24 @@ regexp *rc_regcomp(char *rs)
 	return 0;
     }
 
-    char *end = strchr(rs, '\0');
-    return pregcomp(rs, end, pm);
+    end = strchr(rs, '\0');
+    rx = pregcomp(rs, end, pm);
+    if (!rx)
+    {
+        safefree(pm);
+	croak("Cannot compile regexp");
+    }
+
+    safefree(pm);
+    return rx;
+}
+
+void rc_regfree(void *rx)
+{
+    if (rx)
+    {
+        pregfree(rx);
+    }
 }
 
 static int compare_tails(Arrow *a1, Arrow *a2)
@@ -271,6 +312,22 @@ static int compare_tails(Arrow *a1, Arrow *a2)
 static int compare_regular_tails(int dummy, Arrow *a1, Arrow *a2)
 {
     return compare_tails(a1, a2);
+}
+
+static int compare_left_tail(int anchored, Arrow *a1, Arrow *a2)
+{
+    Arrow tail1;
+    int rv;
+
+    tail1.rn = a1->rn;
+    tail1.spent = a1->spent;
+    rv = bump_with_check(&tail1);
+    if (rv <= 0)
+    {
+        return rv;
+    }
+
+    return compare(anchored, &tail1, a2);
 }
 
 static int compare_mismatch(int anchored, Arrow *a1, Arrow *a2)
@@ -1020,7 +1077,7 @@ static int compare_right_star(int anchored, Arrow *a1, Arrow *a2)
 	alt = (regnode *)malloc(sizeof(regnode) * sz);
 	if (!alt)
 	{
-	    rc_error = "Couldn't allocate memory for curly";
+	    rc_error = "Couldn't allocate memory for star";
 	    return -1;
 	}
 
@@ -1065,6 +1122,54 @@ static int compare_right_star(int anchored, Arrow *a1, Arrow *a2)
     assert(a2->rn->type == END);
     a2->spent = 0;
 
+    return rv;
+}
+
+static int compare_repeat_star(int anchored, Arrow *a1, Arrow *a2)
+{
+    regnode *p1, *p2, *alt1, *alt2;
+    Arrow left, right;
+    int sz1, sz2, rv;
+
+    p1 = a1->rn;
+    assert((p1->type == PLUS) || (p1->type == STAR));
+    p2 = a2->rn;
+    assert(p2->type == STAR);
+
+    sz1 = get_size(p1);
+    if (sz1 <= 0)
+    {
+	return -1;
+    }
+
+    alt1 = alloc_alt(p1 + 1, sz1 - 1);
+    if (!alt1)
+    {
+	return -1;
+    }
+
+    left.rn = alt1;
+    left.spent = 0;
+
+    sz2 = get_size(p2);
+    if (sz2 <= 0)
+    {
+	return -1;
+    }
+
+    alt2 = alloc_alt(p2 + 1, sz2 - 1);
+    if (!alt2)
+    {
+        free(alt1);
+	return -1;
+    }
+
+    right.rn = alt2;
+    right.spent = 0;
+
+    rv = compare(1, &left, &right);
+    free(alt1);
+    free(alt2);
     return rv;
 }
 
@@ -1185,20 +1290,10 @@ static int compare_left_plus(int anchored, Arrow *a1, Arrow *a2)
 	return -1;
     }
 
-    alt = (regnode *)malloc(sizeof(regnode) * (sz - 1));
+    alt = alloc_alt(p1 + 1, sz - 1);
     if (!alt)
     {
-        rc_error = "Couldn't allocate memory for left plus";
 	return -1;
-    }
-
-    memcpy(alt, p1 + 1, sizeof(regnode) * (sz - 1));
-
-    rv = ensure_offset(alt);
-    if (rv < 0)
-    {
-        free(alt);
-	return rv;
     }
 
     if (anchored)
@@ -1331,6 +1426,69 @@ static int compare_next(int anchored, Arrow *a1, Arrow *a2)
     return compare(anchored, a1, a2);
 }
 
+static int compare_plus_plus(int anchored, Arrow *a1, Arrow *a2)
+{
+    regnode *p1, *p2, *alt1, *alt2;
+    Arrow left, right;
+    int sz1, sz2, rv;
+
+    p1 = a1->rn;
+    assert(p1->type == PLUS);
+    p2 = a2->rn;
+    assert(p2->type == PLUS);
+
+    sz1 = get_size(p1);
+    if (sz1 < 0)
+    {
+	return -1;
+    }
+
+    if (sz1 < 2)
+    {
+	rc_error = "Offset is too small";
+	return -1;
+    }
+
+    alt1 = alloc_alt(p1 + 1, sz1 - 1);
+    if (!alt1)
+    {
+	return -1;
+    }
+
+    left.rn = alt1;
+    left.spent = 0;
+
+    sz2 = get_size(p2);
+    if (sz2 < 0)
+    {
+        free(alt1);
+	return -1;
+    }
+
+    if (sz2 < 2)
+    {
+        free(alt1);
+	rc_error = "Offset too small";
+	return -1;
+    }
+
+    alt2 = alloc_alt(p2 + 1, sz2 - 1);
+    if (!alt2)
+    {
+        free(alt1);
+	return -1;
+    }
+
+    right.rn = alt2;
+    right.spent = 0;
+
+    rv = compare(1, &left, &right);
+
+    free(alt1);
+    free(alt2);
+    return rv;
+}
+
 static int compare_curly_plus(int anchored, Arrow *a1, Arrow *a2)
 {
     regnode *p1, *p2, *alt1, *alt2;
@@ -1361,54 +1519,40 @@ static int compare_curly_plus(int anchored, Arrow *a1, Arrow *a2)
 	return -1;
     }
 
-    if (sz1 < 2)
+    if (sz1 < 3)
     {
 	rc_error = "Curly offset too small";
 	return -1;
     }
 
-    alt1 = (regnode *)malloc(sizeof(regnode) * (sz1 - 2));
+    alt1 = alloc_alt(p1 + 2, sz1 - 2);
     if (!alt1)
     {
-	rc_error = "Could not allocate memory for left curly";
 	return -1;
-    }
-
-    memcpy(alt1, p1 + 2, sizeof(regnode) * (sz1 - 2));
-
-    rv = ensure_offset(alt1);
-    if (rv < 0)
-    {
-        free(alt1);
-	return rv;
     }
 
     left.rn = alt1;
     left.spent = 0;
 
     sz2 = get_size(p2);
-    if (sz1 <= 0)
+    if (sz2 < 0)
     {
         free(alt1);
 	return -1;
     }
 
-    alt2 = (regnode *)malloc(sizeof(regnode) * (sz2 - 1));
+    if (sz2 < 2)
+    {
+        free(alt1);
+	rc_error = "Plus offset too small";
+	return -1;
+    }
+
+    alt2 = alloc_alt(p2 + 1, sz2 - 1);
     if (!alt2)
     {
         free(alt1);
-	rc_error = "Could not allocate memory for right plus";
 	return -1;
-    }
-
-    memcpy(alt2, p2 + 1, sizeof(regnode) * (sz2 - 1));
-
-    rv = ensure_offset(alt2);
-    if (rv < 0)
-    {
-        free(alt1);
-        free(alt2);
-	return rv;
     }
 
     right.rn = alt2;
@@ -1445,20 +1589,10 @@ static int compare_curly_star(int anchored, Arrow *a1, Arrow *a2)
 	return -1;
     }
 
-    alt1 = (regnode *)malloc(sizeof(regnode) * (sz1 - 2));
+    alt1 = alloc_alt(p1 + 2, sz1 - 2);
     if (!alt1)
     {
-	rc_error = "Could not allocate memory for left curly";
 	return -1;
-    }
-
-    memcpy(alt1, p1 + 2, sizeof(regnode) * (sz1 - 2));
-
-    rv = ensure_offset(alt1);
-    if (rv < 0)
-    {
-        free(alt1);
-	return rv;
     }
 
     left.rn = alt1;
@@ -1471,22 +1605,11 @@ static int compare_curly_star(int anchored, Arrow *a1, Arrow *a2)
 	return -1;
     }
 
-    alt2 = (regnode *)malloc(sizeof(regnode) * (sz2 - 1));
+    alt2 = alloc_alt(p2 + 1, sz2 - 1);
     if (!alt2)
     {
         free(alt1);
-	rc_error = "Could not allocate memory for right plus";
 	return -1;
-    }
-
-    memcpy(alt2, p2 + 1, sizeof(regnode) * (sz2 - 1));
-
-    rv = ensure_offset(alt2);
-    if (rv < 0)
-    {
-        free(alt1);
-        free(alt2);
-	return rv;
     }
 
     right.rn = alt2;
@@ -1529,7 +1652,7 @@ static int compare_plus_curly(int anchored, Arrow *a1, Arrow *a2)
 	return -1;
     }
 
-    if (cnt[0] > 1)
+    if (cnt[0] > 1) /* FIXME: fails '(?:aa)+' => 'a{2,}' */
     {
         return compare_mismatch(anchored, a1, a2);
     }
@@ -1540,19 +1663,10 @@ static int compare_plus_curly(int anchored, Arrow *a1, Arrow *a2)
 	return -1;
     }
 
-    alt1 = (regnode *)malloc(sizeof(regnode) * (sz1 - 1));
+    alt1 = alloc_alt(p1 + 1, sz1 - 1);
     if (!alt1)
     {
-	rc_error = "Could not allocate memory for plus";
 	return -1;
-    }
-
-    memcpy(alt1, p1 + 1, sizeof(regnode) * (sz1 - 1));
-
-    rv = ensure_offset(alt1);
-    if (rv < 0)
-    {
-	return rv;
     }
 
     left.rn = alt1;
@@ -1586,22 +1700,11 @@ static int compare_plus_curly(int anchored, Arrow *a1, Arrow *a2)
     }
 
     sz2 = p2->next_off + e2 - p2 - 1;
-    alt2 = (regnode *)malloc(sizeof(regnode) * sz2);
+    alt2 = alloc_alt(p2 + 2, sz2);
     if (!alt2)
     {
         free(alt1);
-	rc_error = "Could not allocate memory for curly";
 	return -1;
-    }
-
-    memcpy(alt2, p2 + 2, sizeof(regnode) * sz2);
-
-    rv = ensure_offset(alt2);
-    if (rv < 0)
-    {
-        free(alt1);
-        free(alt2);
-	return rv;
     }
 
     right.rn = alt2;
@@ -1631,25 +1734,22 @@ static int compare_left_curly(int anchored, Arrow *a1, Arrow *a2)
     }
 
     sz = get_size(p1);
-    if (sz <= 0)
+    if (sz < 0)
     {
 	return -1;
     }
 
-    alt = (regnode *)malloc(sizeof(regnode) * (sz - 2));
+    if (sz < 3)
+    {
+	rc_error = "Left curly offset too small";
+	return -1;
+    }
+
+    alt = alloc_alt(p1 + 2, sz - 2);
     if (!alt)
     {
         rc_error = "Couldn't allocate memory for left plus";
 	return -1;
-    }
-
-    memcpy(alt, p1 + 2, sizeof(regnode) * (sz - 2));
-
-    rv = ensure_offset(alt);
-    if (rv < 0)
-    {
-        free(alt);
-	return rv;
     }
 
     if (anchored && !((cnt[0] == 1) && (cnt[1] == 1)))
@@ -1730,6 +1830,12 @@ static int compare_right_curly(int anchored, Arrow *a1, Arrow *a2)
 	    return sz;
 	}
 
+	if (sz < 1)
+	{
+	    rc_error = "Right curly offset too small";
+	    return -1;
+	}
+
 	alt = (regnode *)malloc(sizeof(regnode) * sz);
 	if (!alt)
 	{
@@ -1801,6 +1907,97 @@ static int compare_right_curly(int anchored, Arrow *a1, Arrow *a2)
     }
 
     return compare_right_curly_from_zero(nanch, a1, a2);
+}
+
+static int compare_curly_curly(int anchored, Arrow *a1, Arrow *a2)
+{
+    regnode *p1, *p2, *e2, *alt1, *alt2;
+    Arrow left, right;
+    short *cnt1, *cnt2;
+    int sz1, sz2, rv;
+
+    p1 = a1->rn;
+    assert((p1->type == CURLY) || (p1->type == CURLYM));
+    p2 = a2->rn;
+    assert((p2->type == CURLY) || (p2->type == CURLYM));
+
+    cnt1 = (short *)(p1 + 1);
+    if (cnt1[0] < 0)
+    {
+	rc_error = "Negative minimum for left curly";
+	return -1;
+    }
+
+    cnt2 = (short *)(p2 + 1);
+    if (cnt2[0] < 0)
+    {
+	rc_error = "Negative minimum for right curly";
+	return -1;
+    }
+
+    if (cnt2[0] > cnt1[0]) /* FIXME: fails '(?:aa){1,}' => 'a{2,}' */
+    {
+        return compare_mismatch(anchored, a1, a2);
+    }
+
+    sz1 = get_size(p1);
+    if (sz1 < 3)
+    {
+	rc_error = "Size too small";
+	return -1;
+    }
+
+    alt1 = alloc_alt(p1 + 2, sz1 - 2);
+    if (!alt1)
+    {
+	return -1;
+    }
+
+    left.rn = alt1;
+    left.spent = 0;
+
+    if (p2->next_off < 2)
+    {
+	free(alt1);
+	rc_error = "Right curly offset too small";
+	return -1;
+    }
+
+    e2 = p2 + p2->next_off;
+    while (e2->type != END)
+    {
+        if (!e2->next_off)
+	{
+	    free(alt1);
+	    rc_error = "Zero offset";
+	    return -1;
+	}
+
+	if ((cnt1[1] > cnt2[1]) &&
+	    ((e2->type != NOTHING) && (e2->type != SUCCEED)))
+	{
+	    free(alt1);
+	    return compare_mismatch(anchored, a1, a2);	    
+	}
+
+        e2 += e2->next_off;
+    }
+
+    sz2 = p2->next_off + e2 - p2 - 1;
+    alt2 = alloc_alt(p2 + 2, sz2);
+    if (!alt2)
+    {
+        free(alt1);
+	return -1;
+    }
+
+    right.rn = alt2;
+    right.spent = 0;
+
+    rv = compare(1, &left, &right);
+    free(alt1);
+    free(alt2);
+    return (!rv && !cnt2[0]) ? compare_next(anchored, a1, a2) : rv;
 }
 
 static int compare_bound(int anchored, Arrow *a1, Arrow *a2,
@@ -2094,6 +2291,7 @@ void rc_init()
     dispatch[BOL][BOL] = compare_regular_tails;
     dispatch[SBOL][BOL] = compare_regular_tails;
     dispatch[BRANCH][BOL] = compare_left_branch;
+    dispatch[NOTHING][BOL] = compare_left_tail;
     dispatch[STAR][BOL] = compare_mismatch;
     dispatch[PLUS][BOL] = compare_left_plus;
     dispatch[CURLY][BOL] = compare_left_curly;
@@ -2114,6 +2312,7 @@ void rc_init()
     dispatch[BRANCH][MBOL] = compare_left_branch;
     dispatch[EXACT][MBOL] = compare_exact_multiline;
     dispatch[EXACTF][MBOL] = compare_exact_multiline;
+    dispatch[NOTHING][MBOL] = compare_left_tail;
     dispatch[STAR][MBOL] = compare_mismatch;
     dispatch[PLUS][MBOL] = compare_left_plus;
     dispatch[CURLY][MBOL] = compare_left_curly;
@@ -2127,6 +2326,7 @@ void rc_init()
     dispatch[BOL][SBOL] = compare_regular_tails;
     dispatch[SBOL][SBOL] = compare_regular_tails;
     dispatch[BRANCH][SBOL] = compare_left_branch;
+    dispatch[NOTHING][SBOL] = compare_left_tail;
     dispatch[STAR][SBOL] = compare_mismatch;
     dispatch[PLUS][SBOL] = compare_left_plus;
     dispatch[CURLY][SBOL] = compare_left_curly;
@@ -2140,6 +2340,7 @@ void rc_init()
     dispatch[EOL][EOL] = compare_regular_tails;
     dispatch[SEOL][EOL] = compare_regular_tails;
     dispatch[BRANCH][EOL] = compare_left_branch;
+    dispatch[NOTHING][EOL] = compare_left_tail;
     dispatch[STAR][EOL] = compare_mismatch;
     dispatch[PLUS][EOL] = compare_left_plus;
     dispatch[CURLY][EOL] = compare_left_curly;
@@ -2160,6 +2361,7 @@ void rc_init()
     dispatch[BRANCH][MEOL] = compare_left_branch;
     dispatch[EXACT][MEOL] = compare_exact_multiline;
     dispatch[EXACTF][MEOL] = compare_exact_multiline;
+    dispatch[NOTHING][MEOL] = compare_left_tail;
     dispatch[STAR][MEOL] = compare_mismatch;
     dispatch[PLUS][MEOL] = compare_left_plus;
     dispatch[CURLY][MEOL] = compare_left_curly;
@@ -2173,6 +2375,7 @@ void rc_init()
     dispatch[EOL][SEOL] = compare_regular_tails;
     dispatch[SEOL][SEOL] = compare_regular_tails;
     dispatch[BRANCH][SEOL] = compare_left_branch;
+    dispatch[NOTHING][SEOL] = compare_left_tail;
     dispatch[STAR][SEOL] = 0;
     dispatch[PLUS][SEOL] = compare_left_plus;
     dispatch[CURLY][SEOL] = compare_left_curly;
@@ -2195,6 +2398,7 @@ void rc_init()
     dispatch[BRANCH][BOUND] = compare_left_branch;
     dispatch[EXACT][BOUND] = compare_exact_bound;
     dispatch[EXACTF][BOUND] = compare_exact_bound;
+    dispatch[NOTHING][BOUND] = compare_left_tail;
 
     dispatch[BOL][NBOUND] = compare_bol_nword;
     dispatch[MBOL][NBOUND] = compare_bol_nword;
@@ -2213,6 +2417,7 @@ void rc_init()
     dispatch[BRANCH][NBOUND] = compare_left_branch;
     dispatch[EXACT][NBOUND] = compare_exact_nbound;
     dispatch[EXACTF][NBOUND] = compare_exact_nbound;
+    dispatch[NOTHING][NBOUND] = compare_left_tail;
 
     dispatch[BOL][REG_ANY] = compare_bol;
     dispatch[MBOL][REG_ANY] = compare_bol;
@@ -2229,6 +2434,7 @@ void rc_init()
     dispatch[BRANCH][REG_ANY] = compare_left_branch;
     dispatch[EXACT][REG_ANY] = compare_exact_reg_any;
     dispatch[EXACTF][REG_ANY] = compare_exact_reg_any;
+    dispatch[NOTHING][REG_ANY] = compare_left_tail;
     dispatch[STAR][REG_ANY] = compare_mismatch;
     dispatch[PLUS][REG_ANY] = compare_left_plus;
     dispatch[CURLY][REG_ANY] = compare_left_curly;
@@ -2249,6 +2455,7 @@ void rc_init()
     dispatch[BRANCH][SANY] = compare_left_branch;
     dispatch[EXACT][SANY] = compare_regular_tails;
     dispatch[EXACTF][SANY] = compare_regular_tails;
+    dispatch[NOTHING][SANY] = compare_left_tail;
     dispatch[STAR][SANY] = compare_mismatch;
     dispatch[PLUS][SANY] = compare_left_plus;
     dispatch[CURLY][SANY] = compare_left_curly;
@@ -2269,6 +2476,7 @@ void rc_init()
     dispatch[BRANCH][ANYOF] = compare_left_branch;
     dispatch[EXACT][ANYOF] = compare_exact_anyof;
     dispatch[EXACTF][ANYOF] = compare_exactf_anyof;
+    dispatch[NOTHING][ANYOF] = compare_left_tail;
     dispatch[STAR][ANYOF] = compare_mismatch;
     dispatch[PLUS][ANYOF] = compare_left_plus;
     dispatch[CURLY][ANYOF] = compare_left_curly;
@@ -2289,6 +2497,7 @@ void rc_init()
     dispatch[BRANCH][ALNUM] = compare_left_branch;
     dispatch[EXACT][ALNUM] = compare_exact_alnum;
     dispatch[EXACTF][ALNUM] = compare_exact_alnum;
+    dispatch[NOTHING][ALNUM] = compare_left_tail;
     dispatch[STAR][ALNUM] = compare_mismatch;
     dispatch[PLUS][ALNUM] = compare_left_plus;
     dispatch[CURLY][ALNUM] = compare_left_curly;
@@ -2309,6 +2518,7 @@ void rc_init()
     dispatch[BRANCH][NALNUM] = compare_left_branch;
     dispatch[EXACT][NALNUM] = compare_exact_nalnum;
     dispatch[EXACTF][NALNUM] = compare_exact_nalnum;
+    dispatch[NOTHING][NALNUM] = compare_left_tail;
     dispatch[STAR][NALNUM] = compare_mismatch;
     dispatch[PLUS][NALNUM] = compare_left_plus;
     dispatch[CURLY][NALNUM] = compare_left_curly;
@@ -2329,6 +2539,7 @@ void rc_init()
     dispatch[BRANCH][SPACE] = compare_left_branch;
     dispatch[EXACT][SPACE] = compare_exact_space;
     dispatch[EXACTF][SPACE] = compare_exact_space;
+    dispatch[NOTHING][SPACE] = compare_left_tail;
     dispatch[STAR][SPACE] = compare_mismatch;
     dispatch[PLUS][SPACE] = compare_left_plus;
     dispatch[CURLY][SPACE] = compare_left_curly;
@@ -2349,6 +2560,7 @@ void rc_init()
     dispatch[BRANCH][NSPACE] = compare_left_branch;
     dispatch[EXACT][NSPACE] = compare_exact_nspace;
     dispatch[EXACTF][NSPACE] = compare_exact_nspace;
+    dispatch[NOTHING][NSPACE] = compare_left_tail;
     dispatch[STAR][NSPACE] = compare_mismatch;
     dispatch[PLUS][NSPACE] = compare_left_plus;
     dispatch[CURLY][NSPACE] = compare_left_curly;
@@ -2369,6 +2581,7 @@ void rc_init()
     dispatch[BRANCH][DIGIT] = compare_left_branch;
     dispatch[EXACT][DIGIT] = compare_exact_digit;
     dispatch[EXACTF][DIGIT] = compare_exact_digit;
+    dispatch[NOTHING][DIGIT] = compare_left_tail;
     dispatch[STAR][DIGIT] = compare_mismatch;
     dispatch[PLUS][DIGIT] = compare_left_plus;
     dispatch[CURLY][DIGIT] = compare_left_curly;
@@ -2389,6 +2602,7 @@ void rc_init()
     dispatch[BRANCH][NDIGIT] = compare_left_branch;
     dispatch[EXACT][NDIGIT] = compare_exact_ndigit;
     dispatch[EXACTF][NDIGIT] = compare_exact_ndigit;
+    dispatch[NOTHING][NDIGIT] = compare_left_tail;
     dispatch[STAR][NDIGIT] = compare_mismatch;
     dispatch[PLUS][NDIGIT] = compare_left_plus;
     dispatch[CURLY][NDIGIT] = compare_left_curly;
@@ -2401,6 +2615,7 @@ void rc_init()
 
     dispatch[ANYOF][BRANCH] = compare_anyof_branch;
     dispatch[BRANCH][BRANCH] = compare_left_branch;
+    dispatch[NOTHING][BRANCH] = compare_left_tail;
 
     dispatch[BOL][EXACT] = compare_bol;
     dispatch[MBOL][EXACT] = compare_bol;
@@ -2417,6 +2632,7 @@ void rc_init()
     dispatch[BRANCH][EXACT] = compare_left_branch;
     dispatch[EXACT][EXACT] = compare_exact_exact;
     dispatch[EXACTF][EXACT] = compare_mismatch;
+    dispatch[NOTHING][EXACT] = compare_left_tail;
     dispatch[STAR][EXACT] = compare_mismatch;
     dispatch[PLUS][EXACT] = compare_left_plus;
     dispatch[CURLY][EXACT] = compare_left_curly;
@@ -2437,6 +2653,7 @@ void rc_init()
     dispatch[BRANCH][EXACTF] = compare_left_branch;
     dispatch[EXACT][EXACTF] = compare_exact_exactf;
     dispatch[EXACTF][EXACTF] = compare_exactf_exactf;
+    dispatch[NOTHING][EXACTF] = compare_left_tail;
     dispatch[STAR][EXACTF] = compare_mismatch;
     dispatch[PLUS][EXACTF] = compare_left_plus;
     dispatch[CURLY][EXACTF] = compare_left_curly;
@@ -2447,6 +2664,8 @@ void rc_init()
         dispatch[i][NOTHING] = compare_next;
     }
 
+    dispatch[NOTHING][NOTHING] = compare_regular_tails;
+
     for (i = 0; i < OPTIMIZED; ++i)
     {
 	dispatch[i][STAR] = compare_right_star;
@@ -2455,6 +2674,9 @@ void rc_init()
     dispatch[EOL][STAR] = compare_regular_tails;
     dispatch[MEOL][STAR] = compare_regular_tails;
     dispatch[SEOL][STAR] = compare_regular_tails;
+    dispatch[NOTHING][STAR] = compare_left_tail;
+    dispatch[STAR][STAR] = compare_repeat_star;
+    dispatch[PLUS][STAR] = compare_repeat_star;
     dispatch[CURLY][STAR] = compare_curly_star;
     dispatch[CURLYM][STAR] = compare_curly_star;
 
@@ -2463,7 +2685,8 @@ void rc_init()
 	dispatch[i][PLUS] = compare_right_plus;
     }
 
-    dispatch[PLUS][PLUS] = compare_regular_tails;
+    dispatch[NOTHING][PLUS] = compare_left_tail;
+    dispatch[PLUS][PLUS] = compare_plus_plus;
     dispatch[CURLY][PLUS] = compare_curly_plus;
     dispatch[CURLYM][PLUS] = compare_curly_plus;
 
@@ -2472,12 +2695,18 @@ void rc_init()
 	dispatch[i][CURLY] = compare_right_curly;
     }
 
+    dispatch[NOTHING][CURLY] = compare_left_tail;
     dispatch[PLUS][CURLY] = compare_plus_curly;
+    dispatch[CURLY][CURLY] = compare_curly_curly;
+    dispatch[CURLYM][CURLY] = compare_curly_curly;
 
     for (i = 0; i < OPTIMIZED; ++i)
     {
 	dispatch[i][CURLYM] = compare_right_curly;
     }
 
+    dispatch[NOTHING][CURLYM] = compare_left_tail;
     dispatch[PLUS][CURLYM] = compare_plus_curly;
+    dispatch[CURLY][CURLYM] = compare_curly_curly;
+    dispatch[CURLYM][CURLYM] = compare_curly_curly;
 }

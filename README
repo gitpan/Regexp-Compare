@@ -1,4 +1,4 @@
-Regexp-Compare version 0.01
+Regexp-Compare version 0.02
 ===========================
 
 This module implements a function comparing regular expressions: it
