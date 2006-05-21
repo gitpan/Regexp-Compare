@@ -7,3 +7,10 @@ Revision history for Perl extension Regexp::Compare.
 	- fixed some memory leaks
 	- more successful compares (i.e. of the same regexps)
 	- more tests
+
+0.03  Sun May 21 08:11:16 2006
+	- fixed infinite loop
+	- fixed some memory leaks
+	- more successful compares (now recognizing non-greedy constructs)
+	- added some comments
+	- more tests
