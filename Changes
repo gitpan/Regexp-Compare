@@ -14,3 +14,7 @@ Revision history for Perl extension Regexp::Compare.
 	- more successful compares (now recognizing non-greedy constructs)
 	- added some comments
 	- more tests
+
+0.04  Tue Jun 13 15:19:34 2006
+	- better compares for curlies (including fix for https://rt.cpan.org/Ticket/Display.html?id=19864 )
+	- more tests

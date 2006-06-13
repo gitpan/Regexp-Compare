@@ -852,8 +852,8 @@ static int compare_exact_exact(int anchored, Arrow *a1, Arrow *a2)
     q1 = GET_LITERAL(a1);
     q2 = GET_LITERAL(a2);
 
-    /* fprintf(stderr, "compare_exact_exact(%d, %c, %c)\n", anchored,
-    *q1, *q2); */
+    /* fprintf(stderr, "compare_exact_exact(%d, '%c', '%c')\n", anchored,
+     *q1, *q2); */
 
     if (*q1 != *q2)
     {
@@ -1550,6 +1550,15 @@ static int compare_plus_curly(int anchored, Arrow *a1, Arrow *a2)
     return (!rv && !cnt[0]) ? compare_next(anchored, a1, a2) : rv;
 }
 
+static void dec_curly_counts(short *altcnt)
+{
+    --altcnt[0];
+    if (altcnt[1] < INFINITE_COUNT)
+    {
+	--altcnt[1];
+    }
+}
+
 static int compare_left_curly(int anchored, Arrow *a1, Arrow *a2)
 {
     regnode *p1, *alt, *q;
@@ -1584,15 +1593,50 @@ static int compare_left_curly(int anchored, Arrow *a1, Arrow *a2)
 	return -1;
     }
 
-    alt = alloc_alt(p1 + 2, sz - 2);
-    if (!alt)
+    if (cnt[0] > 1)
     {
-	return -1;
+        /* fprintf(stderr, "curly with non-trivial repeat count\n"); */
+
+	offs = GET_OFFSET(p1);
+	if (offs < 0)
+	{
+	    return -1;
+	}
+	
+	if (offs < 3)
+	{
+	    rc_error = "Left curly offset is too small";
+	    return -1;
+	}
+
+        alt = (regnode *)malloc(sizeof(regnode) * (offs - 2 + sz));
+	if (!alt)
+	{
+	    rc_error = "Could not allocate memory for unrolled curly";
+	    return -1;
+	}
+
+	memcpy(alt, p1 + 2, (offs - 2) * sizeof(regnode));
+	memcpy(alt + offs - 2, p1, sz * sizeof(regnode));
+
+	dec_curly_counts((short *)(alt + offs - 1));
+
+	left.rn = alt;
+	left.spent = 0;
+	rv = compare(1, &left, a2);
+	free(alt);
+	return rv;
     }
 
     if (anchored && !((cnt[0] == 1) && (cnt[1] == 1)))
     {
         /* fprintf(stderr, "anchored curly with variable length\n"); */
+
+	alt = alloc_alt(p1 + 2, sz - 2);
+	if (!alt)
+	{
+	    return -1;
+	}
 
 	offs = get_jump_offset(p1);
 	if (offs <= 0)
@@ -1610,7 +1654,6 @@ static int compare_left_curly(int anchored, Arrow *a1, Arrow *a2)
 	    left.spent = 0;
 
 	    end_offs = offs - 1;
-	    orig_type = alt[end_offs].type;
 	    alt[end_offs].type = END;
 
 	    right.rn = alt;
@@ -1619,78 +1662,112 @@ static int compare_left_curly(int anchored, Arrow *a1, Arrow *a2)
 	    /* fprintf(stderr, "comparing %d to %d\n", left.rn->type,
 	       right.rn->type); */
 	    rv = compare(1, &left, &right);
+	    free(alt);
 	    /* fprintf(stderr, "compare returned %d\n", rv); */
 	    if (rv <= 0)
 	    {
-		free(alt);
 		return rv;
 	    }
-
-	    alt[end_offs].type = orig_type;
 	}
     }
 
-    left.rn = alt;
+    left.rn = p1 + 2;
     left.spent = 0;
-    rv = compare(anchored, &left, a2);
-    free(alt);
-    return rv;
+    return compare(anchored, &left, a2);
 }
 
 static int compare_right_curly(int anchored, Arrow *a1, Arrow *a2)
 {
     regnode *p2, *alt;
     Arrow right;
-    short m, *cnt;
-    int sz, rv, nanch;
+    short *cnt, *altcnt;
+    int sz, rv, offs, nanch;
 
     p2 = a2->rn;
 
-    m = *((short *)(p2 + 1));
-    if (m < 0)
+    cnt = (short *)(p2 + 1);
+    if (cnt[0] < 0)
     {
 	rc_error = "Curly has negative minimum";
 	return -1;
     }
 
-    /* fprintf(stderr, "compare_right_curly from %d\n", m); */
+    /* fprintf(stderr, "compare_right_curly from %d\n", cnt[0]); */
 
     nanch = anchored;
 
-    if (m > 0)
+    if (cnt[0] > 0)
     {
+        /* the repeated expression is mandatory: */
         sz = get_size(p2);
 	if (sz < 0)
 	{
 	    return sz;
 	}
 
-	if (sz < 1)
+	if (sz < 3)
 	{
 	    rc_error = "Right curly offset too small";
 	    return -1;
 	}
 
-	alt = alloc_alt(p2, sz);
-	if (!alt)
-	{
-	    return -1;
-	}
-
-	right.rn = alt + 2;
+	/* we can match it once and recurse (works for
+	   e.g. '.$' vs. '.{3}$')... */
+	right.rn = p2 + 2;
 	right.spent = 0;
 
 	rv = compare(anchored, a1, &right);
 	if (rv < 0)
 	{
-	    free(alt);
 	    return rv;
 	}
 
 	if (!rv)
 	{
-	    free(alt);
-	    return compare_mismatch(anchored, a1, a2);
+	    /* ...or (if we aren't anchored yet) just do the left tail... */
+	    rv = compare_mismatch(anchored, a1, a2);
+	    if (rv)
+	    {
+		return rv;
+	    }
+
+	    /* ...or (last try) unroll the repeat (works for e.g.
+	       'abbc' vs. 'ab{2}c' */
+	    if (cnt[0] > 1)
+	    {
+		offs = GET_OFFSET(p2);
+		if (offs < 0)
+		{
+		    return -1;
+		}
+
+		if (offs < 3)
+		{
+		    rc_error = "Left curly offset is too small";
+		    return -1;
+		}
+
+		alt = (regnode *)malloc(sizeof(regnode) * (offs - 2 + sz));
+		if (!alt)
+		{
+		    rc_error = "Couldn't allocate memory for unrolled curly";
+		    return -1;
+		}
+
+		memcpy(alt, p2 + 2, (offs - 2) * sizeof(regnode));
+		memcpy(alt + offs - 2, p2, sz * sizeof(regnode));
+
+		dec_curly_counts((short *)(alt + offs - 1));
+
+		right.rn = alt;
+		right.spent = 0;
+
+		rv = compare(anchored, a1, &right);
+		free(alt);
+		return rv;
+	    }
+
+	    return 0;
 	}
 
 	/* strictly speaking, matching one repeat didn't *necessarily*
@@ -1698,14 +1775,15 @@ static int compare_right_curly(int anchored, Arrow *a1, Arrow *a2)
 	   pathological */
 	nanch = 1;
 
-	cnt = (short *)(alt + 1);
-	--cnt[0];
-	if (cnt[1] < INFINITE_COUNT)
+	alt = alloc_alt(p2, sz);
+	if (!alt)
 	{
-	    --cnt[1];
+	    return -1;
 	}
 
-	if (cnt[1] > 0)
+	altcnt = (short *)(alt + 1);
+	dec_curly_counts(altcnt);
+	if (altcnt[1] > 0)
 	{
 	    right.rn = alt;
 	    right.spent = 0;
