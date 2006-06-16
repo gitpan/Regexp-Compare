@@ -11,7 +11,7 @@ our @ISA = qw(Exporter);
 our @EXPORT_OK = qw(is_less_or_equal);
 our @EXPORT = qw();
 
-our $VERSION = '0.04';
+our $VERSION = '0.05';
 
 require XSLoader;
 XSLoader::load('Regexp::Compare', $VERSION);
@@ -53,8 +53,8 @@ probably won't do what you want - use
 
 instead.
 
-False return value does I<not> imply that not all strings matched by
-the first regexp are also matched by the second - many regular
+False return value does I<not> imply that there's a string matched by
+the first regexp which isn't matched by the second - many regular
 expressions (i.e. those containing Perl code) are impossible to
 compare, and this module doesn't even implement all possible
 comparisons.
@@ -68,6 +68,8 @@ comparisons.
 =item * comparison fails for regexps with capturing parentheses
 
 =item * comparison fails for regexps with backreferences
+
+=item * comparison fails for regexps with assertions
 
 =item * global variables affecting regexp matching are ignored
 

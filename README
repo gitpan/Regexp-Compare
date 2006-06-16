@@ -1,5 +1,5 @@
-Regexp-Compare version 0.02
-===========================
+Regexp-Compare
+==============
 
 This module implements a function comparing regular expressions: it
 returns true if all strings matched by the first regexp are also
@@ -18,8 +18,10 @@ To install this module type the following:
 
 DEPENDENCIES
 
-This is an XS module, whose compilation requires a C compiler. It
-hasn't been tested on platforms other than Linux.
+This is an XS module, whose compilation requires a C compiler. Because
+it uses internal Perl structures, it's sensitive to platform
+differences and may be broken by new Perl versions - running its
+testsuite for every new installation is highly recommended.
 
 COPYRIGHT AND LICENCE
 

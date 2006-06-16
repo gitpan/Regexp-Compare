@@ -1,5 +1,6 @@
 #include "engine.h"
 #include "regnodes.h"
+#include "regcomp.h"
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
@@ -22,8 +23,6 @@ typedef struct
 } Arrow;
 
 #define GET_LITERAL(a) (((char *)((a)->rn + 1)) + (a)->spent)
-#define GET_BITMAP(a) ((unsigned char *)((a)->rn + 2))
-
 #define GET_OFFSET(rn) ((rn)->next_off ? (rn)->next_off : get_synth_offset(rn))
 
 /* Most functions below have this signature. The first parameter is a
@@ -142,15 +141,24 @@ static int get_synth_offset(regnode *p)
     }
     else if (p->type == ANYOF)
     {
-	return 11;
-    }
-    else
-    {
-        /* fprintf(stderr, "type %d\n", p->type); */
-	rc_error = "Offset not set";
-	return -1;
+        /* other flags obviously exist, but they haven't been seen yet
+	   and it isn't clear what they mean */
+        unsigned int unknown = p->flags & ~(ANYOF_INVERT | ANYOF_LARGE);
+        if (unknown)
+	{
+	    /* p[10] seems always 0 on Linux, but 0xfbfaf9f8 seen on
+	       Windows; for '[\\w\\-_.]+\\.', both 0 and 0x20202020
+	       observed in p[11] - wonder what those are... */
+	    rc_error = "Unknown bitmap format";
+	    return -1;
+	}
+
+	return (p->flags & ANYOF_LARGE) ? 12 : 11;
     }
 
+    /* fprintf(stderr, "type %d\n", p->type); */
+    rc_error = "Offset not set";
+    return -1;
 }
 
 static int get_size(regnode *rn)
@@ -422,9 +430,27 @@ static int compare_bol(int anchored, Arrow *a1, Arrow *a2)
     return rv;
 }
 
+static unsigned char get_bitmap_byte(regnode *p, int i)
+{
+    unsigned char *bitmap;
+    unsigned char loc;
+
+    assert(p->type == ANYOF);
+
+    bitmap = (unsigned char *)(p + 2);
+    loc = bitmap[i];
+    if (p->flags & ANYOF_INVERT)
+    {
+	loc = ~loc;
+    }
+
+    return loc;
+}
+
 static int compare_bitmaps(int anchored, Arrow *a1, Arrow *a2,
     unsigned char *b1, unsigned char *b2)
 {
+    unsigned char loc1, loc2;
     int i;
 
     /* fprintf(stderr, "enter compare_bitmaps(%d, %d, %d\n", anchored,
@@ -432,7 +458,9 @@ static int compare_bitmaps(int anchored, Arrow *a1, Arrow *a2,
 
     for (i = 0; i < 32; ++i)
     {
-	if (b1[i] & ~b2[i])
+        loc1 = b1 ? b1[i] : get_bitmap_byte(a1->rn, i); 
+        loc2 = b2 ? b2[i] : get_bitmap_byte(a2->rn, i); 
+	if (loc1 & ~loc2)
 	{
 	    /* fprintf(stderr, "compare_bitmaps fails at %d: %d does not imply %d\n",
 	       i, b1[i], b2[i]); */
@@ -447,20 +475,19 @@ static int compare_anyof_multiline(int anchored, Arrow *a1, Arrow *a2)
 {
     BitFlag bf;
     Arrow tail1, tail2;
-    unsigned char *bitmap;
-    int i;
     unsigned char req;
+    int i;
+
+    /* fprintf(stderr, "enter compare_anyof_multiline\n"); */
 
     assert(a1->rn->type == ANYOF);
     assert((a2->rn->type == MBOL) || (a2->rn->type == MEOL));
 
-    bitmap = GET_BITMAP(a1);
     init_bit_flag(&bf, '\n');
-
     for (i = 0; i < 32; ++i)
     {
         req = (i != bf.offs) ? 0 : bf.mask;
-	if (bitmap[i] != req)
+	if (get_bitmap_byte(a1->rn, i) != req)
 	{
 	    return compare_mismatch(anchored, a1, a2);
 	}
@@ -490,8 +517,7 @@ static int compare_anyof_anyof(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == ANYOF);
 
-    return compare_bitmaps(anchored, a1, a2, GET_BITMAP(a1),
-        GET_BITMAP(a2));
+    return compare_bitmaps(anchored, a1, a2, 0, 0);
 }
 
 /* compare_bitmaps could replace this method, but when a class
@@ -501,14 +527,12 @@ static int compare_short_byte_class(int anchored, Arrow *a1, Arrow *a2,
     ByteClass *left)
 {
     BitFlag bf;
-    unsigned char *bitmap;
     int i;
 
-    bitmap = GET_BITMAP(a2);
     for (i = 0; i < left->expl_size; ++i)
     {
         init_bit_flag(&bf, (unsigned char)left->expl[i]);
-	if (!(bitmap[bf.offs] & bf.mask))
+	if (!(get_bitmap_byte(a2->rn, bf.offs) & bf.mask))
 	{
 	    return compare_mismatch(anchored, a1, a2);
 	}
@@ -522,8 +546,7 @@ static int compare_alnum_anyof(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ALNUM);
     assert(a2->rn->type == ANYOF);
 
-    return compare_bitmaps(anchored, a1, a2, alphanumeric.bitmap,
-        GET_BITMAP(a2));
+    return compare_bitmaps(anchored, a1, a2, alphanumeric.bitmap, 0);
 }
 
 static int compare_nalnum_anyof(int anchored, Arrow *a1, Arrow *a2)
@@ -531,8 +554,7 @@ static int compare_nalnum_anyof(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == NALNUM);
     assert(a2->rn->type == ANYOF);
 
-    return compare_bitmaps(anchored, a1, a2, alphanumeric.nbitmap,
-        GET_BITMAP(a2));
+    return compare_bitmaps(anchored, a1, a2, alphanumeric.nbitmap, 0);
 }
 
 static int compare_space_anyof(int anchored, Arrow *a1, Arrow *a2)
@@ -548,8 +570,7 @@ static int compare_reg_any_anyof(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == REG_ANY);
     assert(a2->rn->type == ANYOF);
 
-    return compare_bitmaps(anchored, a1, a2, ndot.nbitmap,
-        GET_BITMAP(a2));
+    return compare_bitmaps(anchored, a1, a2, ndot.nbitmap, 0);
 }
 
 static int compare_nspace_anyof(int anchored, Arrow *a1, Arrow *a2)
@@ -557,8 +578,7 @@ static int compare_nspace_anyof(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == NSPACE);
     assert(a2->rn->type == ANYOF);
 
-    return compare_bitmaps(anchored, a1, a2, whitespace.nbitmap,
-        GET_BITMAP(a2));
+    return compare_bitmaps(anchored, a1, a2, whitespace.nbitmap, 0);
 }
 
 static int compare_digit_anyof(int anchored, Arrow *a1, Arrow *a2)
@@ -576,14 +596,12 @@ static int compare_ndigit_anyof(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == NDIGIT);
     assert(a2->rn->type == ANYOF);
 
-    return compare_bitmaps(anchored, a1, a2, digit.nbitmap,
-        GET_BITMAP(a2));
+    return compare_bitmaps(anchored, a1, a2, digit.nbitmap, 0);
 }
 
 static int compare_exact_anyof(int anchored, Arrow *a1, Arrow *a2)
 {
     BitFlag bf;
-    unsigned char *bitmap;
     char *seq;
 
     /* fprintf(stderr, "enter compare_exact_anyof(%d, \n", anchored); */
@@ -592,13 +610,10 @@ static int compare_exact_anyof(int anchored, Arrow *a1, Arrow *a2)
     assert(a2->rn->type == ANYOF);
 
     seq = GET_LITERAL(a1);
-    bitmap = GET_BITMAP(a2);
     init_bit_flag(&bf, (unsigned char)(*seq));
-    if (!(bitmap[bf.offs] & bf.mask))
-    {
-        /* fprintf(stderr, "%c not in bitmap (bitmap[%d] = %d)\n",
-	 *seq, bf.offs, bitmap[bf.offs]); */
 
+    if (!(get_bitmap_byte(a2->rn, bf.offs) & bf.mask))
+    {
         return compare_mismatch(anchored, a1, a2);
     }
 
@@ -608,7 +623,6 @@ static int compare_exact_anyof(int anchored, Arrow *a1, Arrow *a2)
 static int compare_exactf_anyof(int anchored, Arrow *a1, Arrow *a2)
 {
     BitFlag bf;
-    unsigned char *bitmap;
     char *seq;
     char unf[2];
     int i;
@@ -621,12 +635,10 @@ static int compare_exactf_anyof(int anchored, Arrow *a1, Arrow *a2)
     seq = GET_LITERAL(a1);
     init_unfolded(unf, *seq);
 
-    bitmap = GET_BITMAP(a2);
-
     for (i = 0; i < 2; ++i)
     {
         init_bit_flag(&bf, (unsigned char)unf[i]);
-	if (!(bitmap[bf.offs] & bf.mask))
+	if (!(get_bitmap_byte(a2->rn, bf.offs) & bf.mask))
 	{
 	    return compare_mismatch(anchored, a1, a2);
 	}
@@ -716,8 +728,7 @@ static int compare_anyof_reg_any(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == REG_ANY);
 
-    return compare_bitmaps(anchored, a1, a2, GET_BITMAP(a1),
-        ndot.nbitmap);
+    return compare_bitmaps(anchored, a1, a2, 0, ndot.nbitmap);
 }
 
 static int compare_exact_reg_any(int anchored, Arrow *a1, Arrow *a2)
@@ -733,8 +744,7 @@ static int compare_anyof_alnum(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == ALNUM);
 
-    return compare_bitmaps(anchored, a1, a2, GET_BITMAP(a1),
-        alphanumeric.bitmap);
+    return compare_bitmaps(anchored, a1, a2, 0, alphanumeric.bitmap);
 }
 
 static int compare_anyof_nalnum(int anchored, Arrow *a1, Arrow *a2)
@@ -742,8 +752,7 @@ static int compare_anyof_nalnum(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == NALNUM);
 
-    return compare_bitmaps(anchored, a1, a2, GET_BITMAP(a1),
-        alphanumeric.nbitmap);
+    return compare_bitmaps(anchored, a1, a2, 0, alphanumeric.nbitmap);
 }
 
 static int compare_anyof_space(int anchored, Arrow *a1, Arrow *a2)
@@ -751,8 +760,7 @@ static int compare_anyof_space(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == SPACE);
 
-    return compare_bitmaps(anchored, a1, a2, GET_BITMAP(a1),
-        whitespace.bitmap);
+    return compare_bitmaps(anchored, a1, a2, 0, whitespace.bitmap);
 }
 
 static int compare_anyof_nspace(int anchored, Arrow *a1, Arrow *a2)
@@ -760,8 +768,7 @@ static int compare_anyof_nspace(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == NSPACE);
 
-    return compare_bitmaps(anchored, a1, a2, GET_BITMAP(a1),
-        whitespace.nbitmap);
+    return compare_bitmaps(anchored, a1, a2, 0, whitespace.nbitmap);
 }
 
 static int compare_anyof_digit(int anchored, Arrow *a1, Arrow *a2)
@@ -769,8 +776,7 @@ static int compare_anyof_digit(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == DIGIT);
 
-    return compare_bitmaps(anchored, a1, a2, GET_BITMAP(a1),
-        digit.bitmap);
+    return compare_bitmaps(anchored, a1, a2, 0, digit.bitmap);
 }
 
 static int compare_anyof_ndigit(int anchored, Arrow *a1, Arrow *a2)
@@ -778,28 +784,26 @@ static int compare_anyof_ndigit(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == NDIGIT);
 
-    return compare_bitmaps(anchored, a1, a2, GET_BITMAP(a1),
-        digit.nbitmap);
+    return compare_bitmaps(anchored, a1, a2, 0, digit.nbitmap);
 }
 
 static int compare_anyof_exact(int anchored, Arrow *a1, Arrow *a2)
 {
     BitFlag bf;
-    unsigned char *bitmap, *seq;
+    unsigned char *seq;
     int i;
     unsigned char req;
 
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == EXACT);
 
-    bitmap = GET_BITMAP(a1);
     seq = GET_LITERAL(a2);
-    init_bit_flag(&bf, (unsigned char)(*seq));
+    init_bit_flag(&bf, *seq);
 
     for (i = 0; i < 32; ++i)
     {
         req = (i != bf.offs) ? 0 : bf.mask;
-	if (bitmap[i] != req)
+	if (get_bitmap_byte(a1->rn, i) != req)
 	{
 	    return compare_mismatch(anchored, a1, a2);
 	}
@@ -838,13 +842,12 @@ static int compare_anyof_exactf(int anchored, Arrow *a1, Arrow *a2)
         right[bf[i].offs] = bf[i].mask;
     }
 
-    return compare_bitmaps(anchored, a1, a2, GET_BITMAP(a1), right);
+    return compare_bitmaps(anchored, a1, a2, 0, right);
 }
 
 static int compare_exact_exact(int anchored, Arrow *a1, Arrow *a2)
 {
     char *q1, *q2;
-    int rv;
 
     assert(a1->rn->type == EXACT);
     assert(a2->rn->type == EXACT);
@@ -984,15 +987,12 @@ static int compare_left_branch(int anchored, Arrow *a1, Arrow *a2)
 
 static int compare_anyof_branch(int anchored, Arrow *a1, Arrow *a2)
 {
-    unsigned char *bitmap;
     regnode *alt, *t1;
     Arrow left, right;
     int i, j, power, rv, sz, offs;
 
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == BRANCH);
-
-    bitmap = GET_BITMAP(a1);
 
     offs = GET_OFFSET(a1->rn);
     if (offs <= 0)
@@ -1026,7 +1026,7 @@ static int compare_anyof_branch(int anchored, Arrow *a1, Arrow *a2)
         power = 1;
 	for (j = 0; j < 8; ++j)
 	{
-	    if (bitmap[i] & power)
+	    if (get_bitmap_byte(a1->rn, i) & power)
 	    {
 	        alt[1].flags = 8 * i + j;
 		left.rn = alt;
@@ -1476,7 +1476,6 @@ static int compare_curly_star(int anchored, Arrow *a1, Arrow *a2)
 {
     regnode *p1, *p2;
     Arrow left, right;
-    short *cnt;
     int rv;
 
     p1 = a1->rn;
@@ -1564,7 +1563,6 @@ static int compare_left_curly(int anchored, Arrow *a1, Arrow *a2)
     regnode *p1, *alt, *q;
     Arrow left, right;
     int sz, rv, offs, end_offs;
-    unsigned char orig_type;
     short *cnt;
 
     /* fprintf(stderr, "enter compare_left_curly(%d, %d, %d)\n", anchored,
@@ -1817,9 +1815,9 @@ static int compare_curly_curly(int anchored, Arrow *a1, Arrow *a2)
     regnode *p1, *p2, *e2;
     Arrow left, right;
     short *cnt1, *cnt2;
-    int sz1, rv, offs;
+    int rv, offs;
 
-    /* fprintf(stderr, "enter compare_curly_curly\n"); */
+    /* PerlIO_printf(PerlIO_stderr(), "enter compare_curly_curly\n"); */
 
     p1 = a1->rn;
     assert((p1->type == CURLY) || (p1->type == CURLYM) ||
@@ -1879,7 +1877,6 @@ static int compare_bound(int anchored, Arrow *a1, Arrow *a2,
     unsigned char *oktypes)
 {
     Arrow left, right;
-    unsigned char *b1;
     unsigned char t;
     int i;
     char *seq;
@@ -1904,10 +1901,9 @@ static int compare_bound(int anchored, Arrow *a1, Arrow *a2,
     {
         /* fprintf(stderr, "next is bitmap\n"); */
 
-        b1 = GET_BITMAP(&left);
 	for (i = 0; i < 32; ++i)
 	{
-	    if (b1[i] & ~bitmap[i])
+	    if (get_bitmap_byte(left.rn, i) & ~bitmap[i])
 	    {
 		return compare_mismatch(anchored, a1, a2);
 	    }
@@ -1964,26 +1960,31 @@ static int compare_next_nword(int anchored, Arrow *a1, Arrow *a2)
 static int compare_anyof_bounds(int anchored, Arrow *a1, Arrow *a2,
     unsigned char *bitmap)
 {
-    unsigned char *b1;
-    FCompare cmp[3];
+    unsigned char loc;
+    FCompare cmp[2];
     int i;
 
     cmp[0] = compare_next_word;
     cmp[1] = compare_next_nword;
-    cmp[2] = compare_mismatch;
-
-    b1 = GET_BITMAP(a1);
     for (i = 0; (i < 32) && (cmp[0] || cmp[1]); ++i)
     {
-        if (b1[i] & ~bitmap[i])
+        loc = get_bitmap_byte(a1->rn, i);
+
+        if (loc & ~bitmap[i])
 	{
 	     cmp[0] = 0;
 	}
 
-        if (b1[i] & bitmap[i])
+        if (loc & bitmap[i])
 	{
 	     cmp[1] = 0;
 	}
+    }
+
+    if (cmp[0] && cmp[1])
+    {
+	rc_error = "Zero bitmap";
+	return -1;
     }
 
     for (i = 0; i < SIZEOF_ARRAY(cmp); ++i)
@@ -1993,6 +1994,11 @@ static int compare_anyof_bounds(int anchored, Arrow *a1, Arrow *a2,
 	    return (cmp[i])(anchored, a1, a2);
 	}
     }
+
+    /* if would be more elegant to use compare_mismatch as a sentinel
+       in cmp, but VC 2003 then warns that this function might be
+       missing a return... */
+    return compare_mismatch(anchored, a1, a2);
 }
 
 static int compare_anyof_bound(int anchored, Arrow *a1, Arrow *a2)
