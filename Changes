@@ -23,4 +23,6 @@ Revision history for Perl extension Regexp::Compare.
 	- better parsing of character classes (including fix for https://rt.cpan.org/Ticket/Display.html?id=19861 )
 	- more tests
 
+0.06  Sun Feb 18 07:28:28 UTC 2007
+	- fixed infinite loop
 

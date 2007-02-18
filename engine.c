@@ -1178,7 +1178,10 @@ static int compare_right_star(int anchored, Arrow *a1, Arrow *a2)
 	right.rn = p2;
 	right.spent = 0;
 
-	rv = compare_right_star(1, a1, &right);
+	if (!anchored)
+	{
+	    rv = compare_right_star(1, a1, &right);
+	}
     }
 
     if (rv <= 0)
@@ -1282,7 +1285,7 @@ static int compare_right_curly_from_zero(int anchored, Arrow *a1, Arrow *a2)
 	    --cnt[1];
 	}
 
-	if (cnt[1] > 0)
+	if ((cnt[1] > 0) && !anchored)
 	{
 	    right.rn = alt;
 	    right.spent = 0;

@@ -109,10 +109,16 @@ BEGIN {
 	    '^contact \\S+\\@\\S+\\; run by ezmlm$' => '^contact \\S+\\@\\S+; run by ezmlm$',
 	    '[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f-\\xff]' => '[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\xff]',
 	    '[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\xff]' => '[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x7f-\\xff]',
+	    'tast' => 't.*st', 'tast' => 't.+st', 'tast' => 't.{0,}st',
+	    'tast' => 't.{1,}st', 'tast' => 't.{0,2}st',
+	    'tast' => 't.{1,3}st', 't.st' => 't.?st',
+	    'ast' => '.*st', 'bombast' => 'b.*st',
+	    'tast' => 't(?:a|b|c)st'
 	   );
-# things that should match but it isn't clear how to make them:
+# things that should match but it isn''t clear how to make them:
 # 'aa*b' => 'ab',
 # '(?:aa)+' => 'a{2,}', 'a+a+' => 'a{2,}', 'a(?:b+)?c' => 'ab*c',
+# 'taast' => 't.*st'
 
     my %known;
     $i = 0;
@@ -212,7 +218,8 @@ BEGIN {
 	   'a(?:b|)c' => 'ac', '[abc]' => 'a|b', '.{6}$', => '...$',
 	   'a{2}' => 'ab',
 	   '(?:busty|casino|enlarge|gambling|milf|penis)' => '(?:busty|enlarge|milf)',
-	    '(?:[\\w\\-_.]+\\.)?(?:l(?:so|os)tr)\\.[a-z]{2,}' => '(?:[\\w\\-_.]+\\.)?(?:l(?:so|os)tr)\\. ',
+	   '(?:[\\w\\-_.]+\\.)?(?:l(?:so|os)tr)\\.[a-z]{2,}' => '(?:[\\w\\-_.]+\\.)?(?:l(?:so|os)tr)\\. ',
+	   't.st' => 'ta*st',
 	  );
 
     @invalid = ( 'a' => '[a', 'a{2,1}' => 'a' );

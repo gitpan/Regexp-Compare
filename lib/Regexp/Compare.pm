@@ -11,7 +11,7 @@ our @ISA = qw(Exporter);
 our @EXPORT_OK = qw(is_less_or_equal);
 our @EXPORT = qw();
 
-our $VERSION = '0.05';
+our $VERSION = '0.06';
 
 require XSLoader;
 XSLoader::load('Regexp::Compare', $VERSION);
