@@ -1,6 +1,6 @@
 package Regexp::Compare;
 
-require 5.8.7;
+require 5.008_007;
 use strict;
 use warnings;
 
@@ -11,12 +11,13 @@ our @ISA = qw(Exporter);
 our @EXPORT_OK = qw(is_less_or_equal);
 our @EXPORT = qw();
 
-our $VERSION = '0.06';
+our $VERSION = '0.07';
 
 require XSLoader;
 XSLoader::load('Regexp::Compare', $VERSION);
 
 sub is_less_or_equal {
+    local ${^RE_TRIE_MAXBUF} = -1;
     return Regexp::Compare::_is_less_or_equal(@_);
 }
 

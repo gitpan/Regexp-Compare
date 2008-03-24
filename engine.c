@@ -5,6 +5,18 @@
 #include <string.h>
 #include <assert.h>
 
+#if PERL_API_REVISION != 5
+#error This module is only for Perl 5
+#else
+#if PERL_API_VERSION != 8
+#if PERL_API_VERSION == 10
+#define RC_PLUGGABLE_REGEXP_ENGINE
+#else
+#error Unsupported PERL_API_VERSION
+#endif
+#endif
+#endif
+
 #define SIZEOF_ARRAY(a) (sizeof(a) / sizeof(a[0]))
 
 #define TOLOWER(c) ((((c) >= 'A') && ((c) <= 'Z')) ? ((c) - 'A' + 'a') : (c))
@@ -12,6 +24,8 @@
 #define LETTER_COUNT ('z' - 'a' + 1)
 
 #define INFINITE_COUNT 32767
+
+#define TYPE_COUNT (OPTIMIZED + 1)
 
 /* Regexp terms are normally regnodes, except for EXACT (and EXACTF)
    nodes, which can bundle many characters, which we have to compare
@@ -48,8 +62,8 @@ typedef struct
   int expl_size;
   char lookup[256];
   char nlookup[256];
-  unsigned char bitmap[32];
-  unsigned char nbitmap[32];
+  unsigned char bitmap[ANYOF_BITMAP_SIZE];
+  unsigned char nbitmap[ANYOF_BITMAP_SIZE];
 } ByteClass;
 
 char *rc_error = 0;
@@ -72,14 +86,14 @@ static char alphanumeric_expl[11 + 2 * LETTER_COUNT];
 static ByteClass alphanumeric;
 
 /* true flags for ALNUM and its subsets, 0 otherwise */
-static unsigned char alphanumeric_classes[OPTIMIZED];
+static unsigned char alphanumeric_classes[TYPE_COUNT];
 
 /* true flags for NALNUM and its subsets, 0 otherwise */
-static unsigned char non_alphanumeric_classes[OPTIMIZED];
+static unsigned char non_alphanumeric_classes[TYPE_COUNT];
 
-static unsigned char trivial_nodes[OPTIMIZED];
+static unsigned char trivial_nodes[TYPE_COUNT];
 
-static FCompare dispatch[OPTIMIZED][OPTIMIZED];
+static FCompare dispatch[TYPE_COUNT][TYPE_COUNT];
 
 static int compare(int anchored, Arrow *a1, Arrow *a2);
 static int compare_right_branch(int anchored, Arrow *a1, Arrow *a2);
@@ -123,11 +137,26 @@ static void init_unfolded(char *unf, char c)
     unf[1] = ((*unf >= 'a') && (*unf <= 'z')) ? *unf - 'a' + 'A' : *unf;
 }
 
+static int get_assertion_offset(regnode *p)
+{
+    int offs;
+
+    offs = ARG_LOC(p);
+    if (offs <= 2)
+    {
+        rc_error = "Assertion offset too small";
+	return -1;
+    }
+
+    return offs;
+}
+
 static int get_synth_offset(regnode *p)
 {
     assert(!p->next_off);
 
-    if (((p->type == EXACT) || (p->type == EXACTF)) && (p->flags == 1))
+    if (((p->type == EXACT) || (p->type == EXACTF)) &&
+	(p->flags == 1))
     {
 	return 2;
     }
@@ -143,7 +172,8 @@ static int get_synth_offset(regnode *p)
     {
         /* other flags obviously exist, but they haven't been seen yet
 	   and it isn't clear what they mean */
-        unsigned int unknown = p->flags & ~(ANYOF_INVERT | ANYOF_LARGE);
+        unsigned int unknown = p->flags & ~(ANYOF_INVERT |
+	    ANYOF_LARGE | ANYOF_UNICODE);
         if (unknown)
 	{
 	    /* p[10] seems always 0 on Linux, but 0xfbfaf9f8 seen on
@@ -154,6 +184,10 @@ static int get_synth_offset(regnode *p)
 	}
 
 	return (p->flags & ANYOF_LARGE) ? 12 : 11;
+    }
+    else if ((p->type == IFMATCH) || (p->type == UNLESSM))
+    {
+	return get_assertion_offset(p);
     }
 
     /* fprintf(stderr, "type %d\n", p->type); */
@@ -180,11 +214,45 @@ static int get_size(regnode *rn)
     return e - rn + 1;
 }
 
-static regnode *skip_sig(regnode *p)
+static regnode *find_internal(regexp *pt)
 {
-    assert(p);
+#ifdef RC_PLUGGABLE_REGEXP_ENGINE
+    regexp_internal *pr;
+#endif
+    regnode *p;
 
-    if (!((p->flags == 156) &&
+    assert(pt);
+
+#ifdef RC_PLUGGABLE_REGEXP_ENGINE
+
+/* ActivePerl Build 1001 doesn't export PL_core_reg_engine, so
+   the test, however useful, wouldn't link... */
+#if !defined(ACTIVEPERL_PRODUCT)
+    if (pt->engine && (pt->engine != &PL_core_reg_engine))
+    {
+        rc_error = "Alternative regexp engine not supported";
+	return 0;
+    }
+#endif
+
+    pr = RXi_GET(pt);
+    if (!pr)
+    {
+        rc_error = "Internal regexp not set";
+	return 0;
+    }
+
+    p = pr->program;
+#else
+    p = pt->program;
+#endif
+    if (!p)
+    {
+        rc_error = "Compiled regexp not set";
+	return 0;
+    }
+
+    if (!((p->flags == REG_MAGIC) &&
 	(p->next_off == 0)))
     {
         /* fprintf(stderr, "%d %d %d\n", p->flags, p->type, p->next_off); */
@@ -208,6 +276,32 @@ static regnode *alloc_alt(regnode *p, int sz)
 
     memcpy(alt, p, sizeof(regnode) * sz);
 
+    return alt;
+}
+
+static regnode *alloc_terminated(regnode *p, int sz)
+{
+    regnode *alt;
+    int last;
+
+    /* fprintf(stderr, "enter alloc_terminated(, %d\n", sz); */
+
+    assert(sz > 0);
+    alt = alloc_alt(p, sz);
+    if (!alt)
+    {
+	return 0;
+    }
+
+    last = alt[sz - 1].type;
+    /* fprintf(stderr, "type: %d\n", last); */
+    if ((last >= TYPE_COUNT) || !trivial_nodes[last])
+    {
+	rc_error = "Alternative doesn't end like subexpression";
+	return 0;
+    }
+
+    alt[sz - 1].type = END;
     return alt;
 }
 
@@ -295,35 +389,46 @@ static int get_jump_offset(regnode *p)
     return offs;
 }
 
-regexp *rc_regcomp(char *rs)
+regexp *rc_regcomp(SV *rs)
 {
-    PMOP *pm;
-    char *end;
     regexp *rx;
+#if !defined(RC_PLUGGABLE_REGEXP_ENGINE)
+    PMOP *pm;
+    char *ptr;
+    STRLEN len;
+#endif
 
     if (!rs)
     {
 	croak("No regexp to compare");
     }
 
+#if !defined(RC_PLUGGABLE_REGEXP_ENGINE)
     Newz(1, pm, 1, PMOP);
     if (pm == 0)
     {
-	rc_error = "Couldn't allocate memory for PMOP";
-	return 0;
+        croak("Couldn't allocate memory for PMOP");
     }
+
+    ptr = SvPV(rs, len);
 
     ENTER;
     SAVEDESTRUCTOR(safefree, pm);
 
-    end = strchr(rs, '\0');
-    rx = pregcomp(rs, end, pm);
+    rx = pregcomp(ptr, ptr + len, pm);
     if (!rx)
     {
 	croak("Cannot compile regexp");
     }
 
     LEAVE;
+#else
+    rx = pregcomp(rs, 0);
+    if (!rx)
+    {
+	croak("Cannot compile regexp");
+    }
+#endif
 
     return rx;
 }
@@ -404,6 +509,138 @@ static int compare_left_tail(int anchored, Arrow *a1, Arrow *a2)
     return compare(anchored, &tail1, a2);
 }
 
+static int compare_after_assertion(int anchored, Arrow *a1, Arrow *a2)
+{
+    Arrow tail1;
+    int offs;
+
+    assert((a1->rn->type == IFMATCH) || (a1->rn->type == UNLESSM));
+
+    offs = get_assertion_offset(a1->rn);
+    if (offs < 0)
+    {
+	return offs;
+    }
+
+    tail1.rn = a1->rn + offs;
+    tail1.spent = 0;
+    return compare(anchored, &tail1, a2);
+}
+
+static int compare_positive_assertions(int anchored, Arrow *a1, Arrow *a2)
+{
+    regnode *p1, *alt1, *p2, *alt2;
+    int rv, sz1, sz2;
+    Arrow left, right;
+
+    p1 = a1->rn;
+    p2 = a2->rn;
+    assert(p1->type == IFMATCH);
+    assert(p2->type == IFMATCH);
+
+    sz1 = get_assertion_offset(p1);
+    if (sz1 < 0)
+    {
+	return -1;
+    }
+
+    sz2 = get_assertion_offset(p2);
+    if (sz2 < 0)
+    {
+	return -1;
+    }
+
+    alt1 = alloc_terminated(p1 + 2, sz1 - 2);
+    if (!alt1)
+    {
+	return -1;
+    }
+
+    alt2 = alloc_terminated(p2 + 2, sz2 - 2);
+    if (!alt2)
+    {
+        free(alt1);
+	return -1;
+    }
+
+    left.rn = alt1;
+    left.spent = 0;
+    right.rn = alt2;
+    right.spent = 0;
+    rv = compare(0, &left, &right);
+
+    free(alt1);
+    free(alt2);
+
+    if (rv <= 0)
+    {
+	return rv;
+    }
+
+    left.rn = p1 + sz1;
+    left.spent = 0;
+    right.rn = p2 + sz2;
+    right.spent = 0;
+    return compare(anchored, &left, &right);
+}
+
+static int compare_negative_assertions(int anchored, Arrow *a1, Arrow *a2)
+{
+    regnode *p1, *alt1, *p2, *alt2;
+    int rv, sz1, sz2;
+    Arrow left, right;
+
+    p1 = a1->rn;
+    p2 = a2->rn;
+    assert(p1->type == UNLESSM);
+    assert(p2->type == UNLESSM);
+
+    sz1 = get_assertion_offset(p1);
+    if (sz1 < 0)
+    {
+	return -1;
+    }
+
+    sz2 = get_assertion_offset(p2);
+    if (sz2 < 0)
+    {
+	return -1;
+    }
+
+    alt1 = alloc_terminated(p1 + 2, sz1 - 2);
+    if (!alt1)
+    {
+	return -1;
+    }
+
+    alt2 = alloc_terminated(p2 + 2, sz2 - 2);
+    if (!alt2)
+    {
+        free(alt1);
+	return -1;
+    }
+
+    left.rn = alt1;
+    left.spent = 0;
+    right.rn = alt2;
+    right.spent = 0;
+    rv = compare(0, &right, &left);
+
+    free(alt1);
+    free(alt2);
+
+    if (rv <= 0)
+    {
+	return rv;
+    }
+
+    left.rn = p1 + sz1;
+    left.spent = 0;
+    right.rn = p2 + sz2;
+    right.spent = 0;
+    return compare(anchored, &left, &right);
+}
+
 static int compare_bol(int anchored, Arrow *a1, Arrow *a2)
 {
     int rv;
@@ -453,17 +690,17 @@ static int compare_bitmaps(int anchored, Arrow *a1, Arrow *a2,
     unsigned char loc1, loc2;
     int i;
 
-    /* fprintf(stderr, "enter compare_bitmaps(%d, %d, %d\n", anchored,
-       a1->rn->type, a2->rn->type); */
+    /* fprintf(stderr, "enter compare_bitmaps(%d, %d, %d)\n", anchored,
+        a1->rn->type, a2->rn->type); */
 
-    for (i = 0; i < 32; ++i)
+    for (i = 0; i < ANYOF_BITMAP_SIZE; ++i)
     {
         loc1 = b1 ? b1[i] : get_bitmap_byte(a1->rn, i); 
         loc2 = b2 ? b2[i] : get_bitmap_byte(a2->rn, i); 
 	if (loc1 & ~loc2)
 	{
 	    /* fprintf(stderr, "compare_bitmaps fails at %d: %d does not imply %d\n",
-	       i, b1[i], b2[i]); */
+	        i, loc1, loc2); */
 	    return compare_mismatch(anchored, a1, a2);
         }
     }
@@ -483,8 +720,13 @@ static int compare_anyof_multiline(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert((a2->rn->type == MBOL) || (a2->rn->type == MEOL));
 
+    if (a1->rn->flags & ANYOF_UNICODE)
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
+
     init_bit_flag(&bf, '\n');
-    for (i = 0; i < 32; ++i)
+    for (i = 0; i < ANYOF_BITMAP_SIZE; ++i)
     {
         req = (i != bf.offs) ? 0 : bf.mask;
 	if (get_bitmap_byte(a1->rn, i) != req)
@@ -516,6 +758,14 @@ static int compare_anyof_anyof(int anchored, Arrow *a1, Arrow *a2)
 
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == ANYOF);
+
+    if (a1->rn->flags & ANYOF_UNICODE)
+    {
+        /* It would be nice to check at least whether the right regexp
+	   isn't the same, but it's not clear how - different Unicode
+	   classes compile into the same bytecode... */
+	return compare_mismatch(anchored, a1, a2);
+    }
 
     return compare_bitmaps(anchored, a1, a2, 0, 0);
 }
@@ -728,6 +978,11 @@ static int compare_anyof_reg_any(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == REG_ANY);
 
+    if (a1->rn->flags & ANYOF_UNICODE)
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
+
     return compare_bitmaps(anchored, a1, a2, 0, ndot.nbitmap);
 }
 
@@ -744,6 +999,11 @@ static int compare_anyof_alnum(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == ALNUM);
 
+    if (a1->rn->flags & ANYOF_UNICODE)
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
+
     return compare_bitmaps(anchored, a1, a2, 0, alphanumeric.bitmap);
 }
 
@@ -751,6 +1011,11 @@ static int compare_anyof_nalnum(int anchored, Arrow *a1, Arrow *a2)
 {
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == NALNUM);
+
+    if (a1->rn->flags & ANYOF_UNICODE)
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
 
     return compare_bitmaps(anchored, a1, a2, 0, alphanumeric.nbitmap);
 }
@@ -760,6 +1025,11 @@ static int compare_anyof_space(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == SPACE);
 
+    if (a1->rn->flags & ANYOF_UNICODE)
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
+
     return compare_bitmaps(anchored, a1, a2, 0, whitespace.bitmap);
 }
 
@@ -767,6 +1037,11 @@ static int compare_anyof_nspace(int anchored, Arrow *a1, Arrow *a2)
 {
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == NSPACE);
+
+    if (a1->rn->flags & ANYOF_UNICODE)
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
 
     return compare_bitmaps(anchored, a1, a2, 0, whitespace.nbitmap);
 }
@@ -776,6 +1051,11 @@ static int compare_anyof_digit(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == DIGIT);
 
+    if (a1->rn->flags & ANYOF_UNICODE)
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
+
     return compare_bitmaps(anchored, a1, a2, 0, digit.bitmap);
 }
 
@@ -783,6 +1063,11 @@ static int compare_anyof_ndigit(int anchored, Arrow *a1, Arrow *a2)
 {
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == NDIGIT);
+
+    if (a1->rn->flags & ANYOF_UNICODE)
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
 
     return compare_bitmaps(anchored, a1, a2, 0, digit.nbitmap);
 }
@@ -797,10 +1082,15 @@ static int compare_anyof_exact(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == EXACT);
 
+    if (a1->rn->flags & ANYOF_UNICODE)
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
+
     seq = GET_LITERAL(a2);
     init_bit_flag(&bf, *seq);
 
-    for (i = 0; i < 32; ++i)
+    for (i = 0; i < ANYOF_BITMAP_SIZE; ++i)
     {
         req = (i != bf.offs) ? 0 : bf.mask;
 	if (get_bitmap_byte(a1->rn, i) != req)
@@ -817,11 +1107,16 @@ static int compare_anyof_exactf(int anchored, Arrow *a1, Arrow *a2)
     char *seq;
     char unf[2];
     BitFlag bf[2];
-    unsigned char right[32];
+    unsigned char right[ANYOF_BITMAP_SIZE];
     int i;
 
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == EXACTF);
+
+    if (a1->rn->flags & ANYOF_UNICODE)
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
 
     seq = GET_LITERAL(a2);
     init_unfolded(unf, *seq);
@@ -836,7 +1131,7 @@ static int compare_anyof_exactf(int anchored, Arrow *a1, Arrow *a2)
 	bf[0].mask = bf[1].mask = bf[0].mask | bf[1].mask;
     }
 
-    memset(right, 0, 32);
+    memset(right, 0, ANYOF_BITMAP_SIZE);
     for (i = 0; i < 2; ++i)
     {
         right[bf[i].offs] = bf[i].mask;
@@ -1021,7 +1316,7 @@ static int compare_anyof_branch(int anchored, Arrow *a1, Arrow *a2)
 
     right.rn = 0;
 
-    for (i = 0; i < 32; ++i)
+    for (i = 0; i < ANYOF_BITMAP_SIZE; ++i)
     {
         power = 1;
 	for (j = 0; j < 8; ++j)
@@ -1895,7 +2190,7 @@ static int compare_bound(int anchored, Arrow *a1, Arrow *a2,
     }
 
     t = left.rn->type;
-    if (t >= OPTIMIZED)
+    if (t >= TYPE_COUNT)
     {
         rc_error = "Invalid node type";
         return -1;
@@ -1904,7 +2199,12 @@ static int compare_bound(int anchored, Arrow *a1, Arrow *a2,
     {
         /* fprintf(stderr, "next is bitmap\n"); */
 
-	for (i = 0; i < 32; ++i)
+        if (a1->rn->flags & ANYOF_UNICODE)
+	{
+	    return compare_mismatch(anchored, a1, a2);
+	}
+
+	for (i = 0; i < ANYOF_BITMAP_SIZE; ++i)
 	{
 	    if (get_bitmap_byte(left.rn, i) & ~bitmap[i])
 	    {
@@ -1969,7 +2269,7 @@ static int compare_anyof_bounds(int anchored, Arrow *a1, Arrow *a2,
 
     cmp[0] = compare_next_word;
     cmp[1] = compare_next_nword;
-    for (i = 0; (i < 32) && (cmp[0] || cmp[1]); ++i)
+    for (i = 0; (i < ANYOF_BITMAP_SIZE) && (cmp[0] || cmp[1]); ++i)
     {
         loc = get_bitmap_byte(a1->rn, i);
 
@@ -2009,6 +2309,11 @@ static int compare_anyof_bound(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == BOUND);
 
+    if (a1->rn->flags & ANYOF_UNICODE)
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
+
     return compare_anyof_bounds(anchored, a1, a2, alphanumeric.nbitmap);
 }
 
@@ -2016,6 +2321,11 @@ static int compare_anyof_nbound(int anchored, Arrow *a1, Arrow *a2)
 {
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == NBOUND);
+
+    if (a1->rn->flags & ANYOF_UNICODE)
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
 
     return compare_anyof_bounds(anchored, a1, a2, alphanumeric.bitmap);
 }
@@ -2050,22 +2360,58 @@ static int compare_exact_nbound(int anchored, Arrow *a1, Arrow *a2)
     return cmp(anchored, a1, a2);
 }
 
+static int compare_open_open(int anchored, Arrow *a1, Arrow *a2)
+{
+    return compare_tails(anchored, a1, a2);
+}
+
+static int compare_left_open(int anchored, Arrow *a1, Arrow *a2)
+{
+    return compare_left_tail(anchored, a1, a2);
+}
+
+static int compare_right_open(int anchored, Arrow *a1, Arrow *a2)
+{
+    return compare_next(anchored, a1, a2);
+}
+
 static int success(int anchored, Arrow *a1, Arrow *a2)
 {
     return 1;
 }
 
-int rc_compare(regnode *p1, regnode *p2)
+/* #define DEBUG_dump */
+
+int rc_compare(regexp *pt1, regexp *pt2)
 {
     Arrow a1, a2;
+    regnode *p1, *p2;
+#ifdef DEBUG_dump
+    unsigned char *p;
+    int i;    
+#endif
 
-    p1 = skip_sig(p1);
+    p1 = find_internal(pt1);
     if (!p1)
     {
 	return -1;
     }
 
-    p2 = skip_sig(p2);
+#ifdef DEBUG_dump
+    p = (unsigned char *)p1;
+    for (i = 1; i <= 64; ++i)
+    {
+	fprintf(stderr, " %02x", (int)p[i - 1]);
+	if (!(i % 4))
+	{
+	    fprintf(stderr, "\n");
+	}
+    }
+
+    fprintf(stderr, "\n\n");
+#endif
+
+    p2 = find_internal(pt2);
     if (!p2)
     {
 	return -1;
@@ -2086,7 +2432,7 @@ static int compare(int anchored, Arrow *a1, Arrow *a2)
     /* fprintf(stderr, "enter compare(%d, %d, %d)\n", anchored,
        a1->rn->type, a2->rn->type); */
 
-    if ((a1->rn->type >= OPTIMIZED) || (a2->rn->type >= OPTIMIZED))
+    if ((a1->rn->type >= TYPE_COUNT) || (a2->rn->type >= TYPE_COUNT))
     {
         rc_error = "Invalid regexp node type";
         return -1;
@@ -2105,6 +2451,10 @@ static int compare(int anchored, Arrow *a1, Arrow *a2)
 void rc_init()
 {
     int i, wstart;
+
+    /* could have used compile-time assertion, but why bother
+       making it compatible... */
+    assert(ANYOF_BITMAP_SIZE == 32);
 
     init_byte_class(&whitespace, whitespace_expl,
         SIZEOF_ARRAY(whitespace_expl));
@@ -2148,16 +2498,16 @@ void rc_init()
 
     memset(trivial_nodes, 0, SIZEOF_ARRAY(trivial_nodes));
     trivial_nodes[SUCCEED] = trivial_nodes[NOTHING] =
-        trivial_nodes[WHILEM] = 1;
+        trivial_nodes[TAIL] = trivial_nodes[WHILEM] = 1;
 
-    memset(dispatch, 0, sizeof(FCompare) * OPTIMIZED * OPTIMIZED);
+    memset(dispatch, 0, sizeof(FCompare) * TYPE_COUNT * TYPE_COUNT);
 
-    for (i = 0; i < OPTIMIZED; ++i)
+    for (i = 0; i < TYPE_COUNT; ++i)
     {
 	dispatch[i][END] = success;
     }
 
-    for (i = 0; i < OPTIMIZED; ++i)
+    for (i = 0; i < TYPE_COUNT; ++i)
     {
 	dispatch[i][SUCCEED] = compare_next;
     }
@@ -2169,13 +2519,19 @@ void rc_init()
     dispatch[SBOL][BOL] = compare_tails;
     dispatch[BRANCH][BOL] = compare_left_branch;
     dispatch[NOTHING][BOL] = compare_left_tail;
+    dispatch[TAIL][BOL] = compare_left_tail;
     dispatch[STAR][BOL] = compare_mismatch;
     dispatch[PLUS][BOL] = compare_left_plus;
     dispatch[CURLY][BOL] = compare_left_curly;
     dispatch[CURLYM][BOL] = compare_left_curly;
     dispatch[CURLYX][BOL] = compare_left_curly;
     dispatch[WHILEM][BOL] = compare_left_tail;
+    dispatch[OPEN][BOL] = compare_left_open;
+    dispatch[CLOSE][BOL] = compare_left_tail;
+    dispatch[IFMATCH][BOL] = compare_after_assertion;
+    dispatch[UNLESSM][BOL] = compare_after_assertion;
     dispatch[MINMOD][BOL] = compare_left_tail;
+    dispatch[OPTIMIZED][BOL] = compare_left_tail;
 
     dispatch[SUCCEED][MBOL] = compare_left_tail;
     dispatch[BOL][MBOL] = compare_tails;
@@ -2194,39 +2550,57 @@ void rc_init()
     dispatch[EXACT][MBOL] = compare_exact_multiline;
     dispatch[EXACTF][MBOL] = compare_exact_multiline;
     dispatch[NOTHING][MBOL] = compare_left_tail;
+    dispatch[TAIL][MBOL] = compare_left_tail;
     dispatch[STAR][MBOL] = compare_mismatch;
     dispatch[PLUS][MBOL] = compare_left_plus;
     dispatch[CURLY][MBOL] = compare_left_curly;
     dispatch[CURLYM][MBOL] = compare_left_curly;
     dispatch[CURLYX][MBOL] = compare_left_curly;
     dispatch[WHILEM][MBOL] = compare_left_tail;
+    dispatch[OPEN][MBOL] = compare_left_open;
+    dispatch[CLOSE][MBOL] = compare_left_tail;
+    dispatch[IFMATCH][MBOL] = compare_after_assertion;
+    dispatch[UNLESSM][MBOL] = compare_after_assertion;
     dispatch[MINMOD][MBOL] = compare_left_tail;
+    dispatch[OPTIMIZED][MBOL] = compare_left_tail;
 
     dispatch[SUCCEED][SBOL] = compare_left_tail;
     dispatch[BOL][SBOL] = compare_tails;
     dispatch[SBOL][SBOL] = compare_tails;
     dispatch[BRANCH][SBOL] = compare_left_branch;
     dispatch[NOTHING][SBOL] = compare_left_tail;
+    dispatch[TAIL][SBOL] = compare_left_tail;
     dispatch[STAR][SBOL] = compare_mismatch;
     dispatch[PLUS][SBOL] = compare_left_plus;
     dispatch[CURLY][SBOL] = compare_left_curly;
     dispatch[CURLYM][SBOL] = compare_left_curly;
     dispatch[CURLYX][SBOL] = compare_left_curly;
     dispatch[WHILEM][SBOL] = compare_left_tail;
+    dispatch[OPEN][SBOL] = compare_left_open;
+    dispatch[CLOSE][SBOL] = compare_left_tail;
+    dispatch[IFMATCH][SBOL] = compare_after_assertion;
+    dispatch[UNLESSM][SBOL] = compare_after_assertion;
     dispatch[MINMOD][SBOL] = compare_left_tail;
+    dispatch[OPTIMIZED][SBOL] = compare_left_tail;
 
     dispatch[SUCCEED][EOL] = compare_left_tail;
     dispatch[EOL][EOL] = compare_tails;
     dispatch[SEOL][EOL] = compare_tails;
     dispatch[BRANCH][EOL] = compare_left_branch;
     dispatch[NOTHING][EOL] = compare_left_tail;
+    dispatch[TAIL][EOL] = compare_left_tail;
     dispatch[STAR][EOL] = compare_mismatch;
     dispatch[PLUS][EOL] = compare_left_plus;
     dispatch[CURLY][EOL] = compare_left_curly;
     dispatch[CURLYM][EOL] = compare_left_curly;
     dispatch[CURLYX][EOL] = compare_left_curly;
     dispatch[WHILEM][EOL] = compare_left_tail;
+    dispatch[OPEN][EOL] = compare_left_open;
+    dispatch[CLOSE][EOL] = compare_left_tail;
+    dispatch[IFMATCH][EOL] = compare_after_assertion;
+    dispatch[UNLESSM][EOL] = compare_after_assertion;
     dispatch[MINMOD][EOL] = compare_left_tail;
+    dispatch[OPTIMIZED][EOL] = compare_left_tail;
 
     dispatch[SUCCEED][MEOL] = compare_left_tail;
     dispatch[EOL][MEOL] = compare_tails;
@@ -2245,26 +2619,38 @@ void rc_init()
     dispatch[EXACT][MEOL] = compare_exact_multiline;
     dispatch[EXACTF][MEOL] = compare_exact_multiline;
     dispatch[NOTHING][MEOL] = compare_left_tail;
+    dispatch[TAIL][MEOL] = compare_left_tail;
     dispatch[STAR][MEOL] = compare_mismatch;
     dispatch[PLUS][MEOL] = compare_left_plus;
     dispatch[CURLY][MEOL] = compare_left_curly;
     dispatch[CURLYM][MEOL] = compare_left_curly;
     dispatch[CURLYX][MEOL] = compare_left_curly;
     dispatch[WHILEM][MEOL] = compare_left_tail;
+    dispatch[OPEN][MEOL] = compare_left_open;
+    dispatch[CLOSE][MEOL] = compare_left_tail;
+    dispatch[IFMATCH][MEOL] = compare_after_assertion;
+    dispatch[UNLESSM][MEOL] = compare_after_assertion;
     dispatch[MINMOD][MEOL] = compare_left_tail;
+    dispatch[OPTIMIZED][MEOL] = compare_left_tail;
 
     dispatch[SUCCEED][SEOL] = compare_left_tail;
     dispatch[EOL][SEOL] = compare_tails;
     dispatch[SEOL][SEOL] = compare_tails;
     dispatch[BRANCH][SEOL] = compare_left_branch;
     dispatch[NOTHING][SEOL] = compare_left_tail;
+    dispatch[TAIL][SEOL] = compare_left_tail;
     dispatch[STAR][SEOL] = 0;
     dispatch[PLUS][SEOL] = compare_left_plus;
     dispatch[CURLY][SEOL] = compare_left_curly;
     dispatch[CURLYM][SEOL] = compare_left_curly;
     dispatch[CURLYX][SEOL] = compare_left_curly;
     dispatch[WHILEM][SEOL] = compare_left_tail;
+    dispatch[OPEN][SEOL] = compare_left_open;
+    dispatch[CLOSE][SEOL] = compare_left_tail;
+    dispatch[IFMATCH][SEOL] = compare_after_assertion;
+    dispatch[UNLESSM][SEOL] = compare_after_assertion;
     dispatch[MINMOD][SEOL] = compare_left_tail;
+    dispatch[OPTIMIZED][SEOL] = compare_left_tail;
 
     dispatch[SUCCEED][BOUND] = compare_left_tail;
     dispatch[BOL][BOUND] = compare_bol_word;
@@ -2285,8 +2671,17 @@ void rc_init()
     dispatch[EXACT][BOUND] = compare_exact_bound;
     dispatch[EXACTF][BOUND] = compare_exact_bound;
     dispatch[NOTHING][BOUND] = compare_left_tail;
+    dispatch[TAIL][BOUND] = compare_left_tail;
+    dispatch[CURLY][BOUND] = compare_left_curly;
+    dispatch[CURLYM][BOUND] = compare_left_curly;
+    dispatch[CURLYX][BOUND] = compare_left_curly;
     dispatch[WHILEM][BOUND] = compare_left_tail;
+    dispatch[OPEN][BOUND] = compare_left_open;
+    dispatch[CLOSE][BOUND] = compare_left_tail;
+    dispatch[IFMATCH][BOUND] = compare_after_assertion;
+    dispatch[UNLESSM][BOUND] = compare_after_assertion;
     dispatch[MINMOD][BOUND] = compare_left_tail;
+    dispatch[OPTIMIZED][BOUND] = compare_left_tail;
 
     dispatch[SUCCEED][NBOUND] = compare_left_tail;
     dispatch[BOL][NBOUND] = compare_bol_nword;
@@ -2307,8 +2702,17 @@ void rc_init()
     dispatch[EXACT][NBOUND] = compare_exact_nbound;
     dispatch[EXACTF][NBOUND] = compare_exact_nbound;
     dispatch[NOTHING][NBOUND] = compare_left_tail;
+    dispatch[TAIL][NBOUND] = compare_left_tail;
+    dispatch[CURLY][NBOUND] = compare_left_curly;
+    dispatch[CURLYM][NBOUND] = compare_left_curly;
+    dispatch[CURLYX][NBOUND] = compare_left_curly;
     dispatch[WHILEM][NBOUND] = compare_left_tail;
+    dispatch[OPEN][NBOUND] = compare_left_open;
+    dispatch[CLOSE][NBOUND] = compare_left_tail;
+    dispatch[IFMATCH][NBOUND] = compare_after_assertion;
+    dispatch[UNLESSM][NBOUND] = compare_after_assertion;
     dispatch[MINMOD][NBOUND] = compare_left_tail;
+    dispatch[OPTIMIZED][NBOUND] = compare_left_tail;
 
     dispatch[SUCCEED][REG_ANY] = compare_left_tail;
     dispatch[BOL][REG_ANY] = compare_bol;
@@ -2329,13 +2733,19 @@ void rc_init()
     dispatch[EXACT][REG_ANY] = compare_exact_reg_any;
     dispatch[EXACTF][REG_ANY] = compare_exact_reg_any;
     dispatch[NOTHING][REG_ANY] = compare_left_tail;
+    dispatch[TAIL][REG_ANY] = compare_left_tail;
     dispatch[STAR][REG_ANY] = compare_mismatch;
     dispatch[PLUS][REG_ANY] = compare_left_plus;
     dispatch[CURLY][REG_ANY] = compare_left_curly;
     dispatch[CURLYM][REG_ANY] = compare_left_curly;
     dispatch[CURLYX][REG_ANY] = compare_left_curly;
     dispatch[WHILEM][REG_ANY] = compare_left_tail;
+    dispatch[OPEN][REG_ANY] = compare_left_open;
+    dispatch[CLOSE][REG_ANY] = compare_left_tail;
+    dispatch[IFMATCH][REG_ANY] = compare_after_assertion;
+    dispatch[UNLESSM][REG_ANY] = compare_after_assertion;
     dispatch[MINMOD][REG_ANY] = compare_left_tail;
+    dispatch[OPTIMIZED][REG_ANY] = compare_left_tail;
 
     dispatch[SUCCEED][SANY] = compare_left_tail;
     dispatch[BOL][SANY] = compare_bol;
@@ -2356,13 +2766,19 @@ void rc_init()
     dispatch[EXACT][SANY] = compare_tails;
     dispatch[EXACTF][SANY] = compare_tails;
     dispatch[NOTHING][SANY] = compare_left_tail;
+    dispatch[TAIL][SANY] = compare_left_tail;
     dispatch[STAR][SANY] = compare_mismatch;
     dispatch[PLUS][SANY] = compare_left_plus;
     dispatch[CURLY][SANY] = compare_left_curly;
     dispatch[CURLYM][SANY] = compare_left_curly;
     dispatch[CURLYX][SANY] = compare_left_curly;
     dispatch[WHILEM][SANY] = compare_left_tail;
+    dispatch[OPEN][SANY] = compare_left_open;
+    dispatch[CLOSE][SANY] = compare_left_tail;
+    dispatch[IFMATCH][SANY] = compare_after_assertion;
+    dispatch[UNLESSM][SANY] = compare_after_assertion;
     dispatch[MINMOD][SANY] = compare_left_tail;
+    dispatch[OPTIMIZED][SANY] = compare_left_tail;
 
     dispatch[SUCCEED][ANYOF] = compare_left_tail;
     dispatch[BOL][ANYOF] = compare_bol;
@@ -2383,13 +2799,19 @@ void rc_init()
     dispatch[EXACT][ANYOF] = compare_exact_anyof;
     dispatch[EXACTF][ANYOF] = compare_exactf_anyof;
     dispatch[NOTHING][ANYOF] = compare_left_tail;
+    dispatch[TAIL][ANYOF] = compare_left_tail;
     dispatch[STAR][ANYOF] = compare_mismatch;
     dispatch[PLUS][ANYOF] = compare_left_plus;
     dispatch[CURLY][ANYOF] = compare_left_curly;
     dispatch[CURLYM][ANYOF] = compare_left_curly;
     dispatch[CURLYX][ANYOF] = compare_left_curly;
     dispatch[WHILEM][ANYOF] = compare_left_tail;
+    dispatch[OPEN][ANYOF] = compare_left_open;
+    dispatch[CLOSE][ANYOF] = compare_left_tail;
+    dispatch[IFMATCH][ANYOF] = compare_after_assertion;
+    dispatch[UNLESSM][ANYOF] = compare_after_assertion;
     dispatch[MINMOD][ANYOF] = compare_left_tail;
+    dispatch[OPTIMIZED][ANYOF] = compare_left_tail;
 
     dispatch[SUCCEED][ALNUM] = compare_left_tail;
     dispatch[BOL][ALNUM] = compare_bol;
@@ -2410,13 +2832,19 @@ void rc_init()
     dispatch[EXACT][ALNUM] = compare_exact_alnum;
     dispatch[EXACTF][ALNUM] = compare_exact_alnum;
     dispatch[NOTHING][ALNUM] = compare_left_tail;
+    dispatch[TAIL][ALNUM] = compare_left_tail;
     dispatch[STAR][ALNUM] = compare_mismatch;
     dispatch[PLUS][ALNUM] = compare_left_plus;
     dispatch[CURLY][ALNUM] = compare_left_curly;
     dispatch[CURLYM][ALNUM] = compare_left_curly;
     dispatch[CURLYX][ALNUM] = compare_left_curly;
     dispatch[WHILEM][ALNUM] = compare_left_tail;
+    dispatch[OPEN][ALNUM] = compare_left_open;
+    dispatch[CLOSE][ALNUM] = compare_left_tail;
+    dispatch[IFMATCH][ALNUM] = compare_after_assertion;
+    dispatch[UNLESSM][ALNUM] = compare_after_assertion;
     dispatch[MINMOD][ALNUM] = compare_left_tail;
+    dispatch[OPTIMIZED][ALNUM] = compare_left_tail;
 
     dispatch[SUCCEED][NALNUM] = compare_left_tail;
     dispatch[BOL][NALNUM] = compare_bol;
@@ -2437,13 +2865,19 @@ void rc_init()
     dispatch[EXACT][NALNUM] = compare_exact_nalnum;
     dispatch[EXACTF][NALNUM] = compare_exact_nalnum;
     dispatch[NOTHING][NALNUM] = compare_left_tail;
+    dispatch[TAIL][NALNUM] = compare_left_tail;
     dispatch[STAR][NALNUM] = compare_mismatch;
     dispatch[PLUS][NALNUM] = compare_left_plus;
     dispatch[CURLY][NALNUM] = compare_left_curly;
     dispatch[CURLYM][NALNUM] = compare_left_curly;
     dispatch[CURLYX][NALNUM] = compare_left_curly;
     dispatch[WHILEM][NALNUM] = compare_left_tail;
+    dispatch[OPEN][NALNUM] = compare_left_open;
+    dispatch[CLOSE][NALNUM] = compare_left_tail;
+    dispatch[IFMATCH][NALNUM] = compare_after_assertion;
+    dispatch[UNLESSM][NALNUM] = compare_after_assertion;
     dispatch[MINMOD][NALNUM] = compare_left_tail;
+    dispatch[OPTIMIZED][NALNUM] = compare_left_tail;
 
     dispatch[SUCCEED][SPACE] = compare_left_tail;
     dispatch[BOL][SPACE] = compare_bol;
@@ -2464,13 +2898,19 @@ void rc_init()
     dispatch[EXACT][SPACE] = compare_exact_space;
     dispatch[EXACTF][SPACE] = compare_exact_space;
     dispatch[NOTHING][SPACE] = compare_left_tail;
+    dispatch[TAIL][SPACE] = compare_left_tail;
     dispatch[STAR][SPACE] = compare_mismatch;
     dispatch[PLUS][SPACE] = compare_left_plus;
     dispatch[CURLY][SPACE] = compare_left_curly;
     dispatch[CURLYM][SPACE] = compare_left_curly;
     dispatch[CURLYX][SPACE] = compare_left_curly;
     dispatch[WHILEM][SPACE] = compare_left_tail;
+    dispatch[OPEN][SPACE] = compare_left_open;
+    dispatch[CLOSE][SPACE] = compare_left_tail;
+    dispatch[IFMATCH][SPACE] = compare_after_assertion;
+    dispatch[UNLESSM][SPACE] = compare_after_assertion;
     dispatch[MINMOD][SPACE] = compare_left_tail;
+    dispatch[OPTIMIZED][SPACE] = compare_left_tail;
 
     dispatch[SUCCEED][NSPACE] = compare_left_tail;
     dispatch[BOL][NSPACE] = compare_bol;
@@ -2491,13 +2931,19 @@ void rc_init()
     dispatch[EXACT][NSPACE] = compare_exact_nspace;
     dispatch[EXACTF][NSPACE] = compare_exact_nspace;
     dispatch[NOTHING][NSPACE] = compare_left_tail;
+    dispatch[TAIL][NSPACE] = compare_left_tail;
     dispatch[STAR][NSPACE] = compare_mismatch;
     dispatch[PLUS][NSPACE] = compare_left_plus;
     dispatch[CURLY][NSPACE] = compare_left_curly;
     dispatch[CURLYM][NSPACE] = compare_left_curly;
     dispatch[CURLYX][NSPACE] = compare_left_curly;
     dispatch[WHILEM][NSPACE] = compare_left_tail;
+    dispatch[OPEN][NSPACE] = compare_left_open;
+    dispatch[CLOSE][NSPACE] = compare_left_tail;
+    dispatch[IFMATCH][NSPACE] = compare_after_assertion;
+    dispatch[UNLESSM][NSPACE] = compare_after_assertion;
     dispatch[MINMOD][NSPACE] = compare_left_tail;
+    dispatch[OPTIMIZED][NSPACE] = compare_left_tail;
 
     dispatch[SUCCEED][DIGIT] = compare_left_tail;
     dispatch[BOL][DIGIT] = compare_bol;
@@ -2518,13 +2964,19 @@ void rc_init()
     dispatch[EXACT][DIGIT] = compare_exact_digit;
     dispatch[EXACTF][DIGIT] = compare_exact_digit;
     dispatch[NOTHING][DIGIT] = compare_left_tail;
+    dispatch[TAIL][DIGIT] = compare_left_tail;
     dispatch[STAR][DIGIT] = compare_mismatch;
     dispatch[PLUS][DIGIT] = compare_left_plus;
     dispatch[CURLY][DIGIT] = compare_left_curly;
     dispatch[CURLYM][DIGIT] = compare_left_curly;
     dispatch[CURLYX][DIGIT] = compare_left_curly;
     dispatch[WHILEM][DIGIT] = compare_left_tail;
+    dispatch[OPEN][DIGIT] = compare_left_open;
+    dispatch[CLOSE][DIGIT] = compare_left_tail;
+    dispatch[IFMATCH][DIGIT] = compare_after_assertion;
+    dispatch[UNLESSM][DIGIT] = compare_after_assertion;
     dispatch[MINMOD][DIGIT] = compare_left_tail;
+    dispatch[OPTIMIZED][DIGIT] = compare_left_tail;
 
     dispatch[SUCCEED][NDIGIT] = compare_left_tail;
     dispatch[BOL][NDIGIT] = compare_bol;
@@ -2545,15 +2997,21 @@ void rc_init()
     dispatch[EXACT][NDIGIT] = compare_exact_ndigit;
     dispatch[EXACTF][NDIGIT] = compare_exact_ndigit;
     dispatch[NOTHING][NDIGIT] = compare_left_tail;
+    dispatch[TAIL][NDIGIT] = compare_left_tail;
     dispatch[STAR][NDIGIT] = compare_mismatch;
     dispatch[PLUS][NDIGIT] = compare_left_plus;
     dispatch[CURLY][NDIGIT] = compare_left_curly;
     dispatch[CURLYM][NDIGIT] = compare_left_curly;
     dispatch[CURLYX][NDIGIT] = compare_left_curly;
     dispatch[WHILEM][NDIGIT] = compare_left_tail;
+    dispatch[OPEN][NDIGIT] = compare_left_open;
+    dispatch[CLOSE][NDIGIT] = compare_left_tail;
+    dispatch[IFMATCH][NDIGIT] = compare_after_assertion;
+    dispatch[UNLESSM][NDIGIT] = compare_after_assertion;
     dispatch[MINMOD][NDIGIT] = compare_left_tail;
+    dispatch[OPTIMIZED][NDIGIT] = compare_left_tail;
 
-    for (i = 0; i < OPTIMIZED; ++i)
+    for (i = 0; i < TYPE_COUNT; ++i)
     {
 	dispatch[i][BRANCH] = compare_right_branch;
     }
@@ -2562,8 +3020,14 @@ void rc_init()
     dispatch[ANYOF][BRANCH] = compare_anyof_branch;
     dispatch[BRANCH][BRANCH] = compare_left_branch;
     dispatch[NOTHING][BRANCH] = compare_left_tail;
+    dispatch[TAIL][BRANCH] = compare_left_tail;
     dispatch[WHILEM][BRANCH] = compare_left_tail;
+    dispatch[OPEN][BRANCH] = compare_left_open;
+    dispatch[CLOSE][BRANCH] = compare_left_tail;
+    dispatch[IFMATCH][BRANCH] = compare_after_assertion;
+    dispatch[UNLESSM][BRANCH] = compare_after_assertion;
     dispatch[MINMOD][BRANCH] = compare_left_tail;
+    dispatch[OPTIMIZED][BRANCH] = compare_left_tail;
 
     dispatch[SUCCEED][EXACT] = compare_left_tail;
     dispatch[BOL][EXACT] = compare_bol;
@@ -2584,13 +3048,19 @@ void rc_init()
     dispatch[EXACT][EXACT] = compare_exact_exact;
     dispatch[EXACTF][EXACT] = compare_exactf_exact;
     dispatch[NOTHING][EXACT] = compare_left_tail;
+    dispatch[TAIL][EXACT] = compare_left_tail;
     dispatch[STAR][EXACT] = compare_mismatch;
     dispatch[PLUS][EXACT] = compare_left_plus;
     dispatch[CURLY][EXACT] = compare_left_curly;
     dispatch[CURLYM][EXACT] = compare_left_curly;
     dispatch[CURLYX][EXACT] = compare_left_curly;
     dispatch[WHILEM][EXACT] = compare_left_tail;
+    dispatch[OPEN][EXACT] = compare_left_open;
+    dispatch[CLOSE][EXACT] = compare_left_tail;
+    dispatch[IFMATCH][EXACT] = compare_after_assertion;
+    dispatch[UNLESSM][EXACT] = compare_after_assertion;
     dispatch[MINMOD][EXACT] = compare_left_tail;
+    dispatch[OPTIMIZED][EXACT] = compare_left_tail;
 
     dispatch[SUCCEED][EXACTF] = compare_left_tail;
     dispatch[BOL][EXACTF] = compare_bol;
@@ -2611,25 +3081,47 @@ void rc_init()
     dispatch[EXACT][EXACTF] = compare_exact_exactf;
     dispatch[EXACTF][EXACTF] = compare_exactf_exactf;
     dispatch[NOTHING][EXACTF] = compare_left_tail;
+    dispatch[TAIL][EXACTF] = compare_left_tail;
     dispatch[STAR][EXACTF] = compare_mismatch;
     dispatch[PLUS][EXACTF] = compare_left_plus;
     dispatch[CURLY][EXACTF] = compare_left_curly;
     dispatch[CURLYM][EXACTF] = compare_left_curly;
     dispatch[CURLYX][EXACTF] = compare_left_curly;
     dispatch[WHILEM][EXACTF] = compare_left_tail;
+    dispatch[OPEN][EXACTF] = compare_left_open;
+    dispatch[CLOSE][EXACTF] = compare_left_tail;
+    dispatch[IFMATCH][EXACTF] = compare_after_assertion;
+    dispatch[UNLESSM][EXACTF] = compare_after_assertion;
     dispatch[MINMOD][EXACTF] = compare_left_tail;
+    dispatch[OPTIMIZED][EXACTF] = compare_left_tail;
 
-    for (i = 0; i < OPTIMIZED; ++i)
+    for (i = 0; i < TYPE_COUNT; ++i)
     {
         dispatch[i][NOTHING] = compare_next;
     }
 
     dispatch[SUCCEED][NOTHING] = compare_tails;
     dispatch[NOTHING][NOTHING] = compare_tails;
+    dispatch[TAIL][NOTHING] = compare_tails;
     dispatch[WHILEM][NOTHING] = compare_tails;
+    dispatch[CLOSE][NOTHING] = compare_tails;
     dispatch[MINMOD][NOTHING] = compare_tails;
+    dispatch[OPTIMIZED][NOTHING] = compare_tails;
 
-    for (i = 0; i < OPTIMIZED; ++i)
+    for (i = 0; i < TYPE_COUNT; ++i)
+    {
+        dispatch[i][TAIL] = compare_next;
+    }
+
+    dispatch[SUCCEED][TAIL] = compare_tails;
+    dispatch[NOTHING][TAIL] = compare_tails;
+    dispatch[TAIL][TAIL] = compare_tails;
+    dispatch[WHILEM][TAIL] = compare_tails;
+    dispatch[CLOSE][TAIL] = compare_tails;
+    dispatch[MINMOD][TAIL] = compare_tails;
+    dispatch[OPTIMIZED][TAIL] = compare_tails;
+
+    for (i = 0; i < TYPE_COUNT; ++i)
     {
 	dispatch[i][STAR] = compare_right_star;
     }
@@ -2639,87 +3131,222 @@ void rc_init()
     dispatch[MEOL][STAR] = compare_tails;
     dispatch[SEOL][STAR] = compare_tails;
     dispatch[NOTHING][STAR] = compare_left_tail;
+    dispatch[TAIL][STAR] = compare_left_tail;
     dispatch[STAR][STAR] = compare_repeat_repeat;
     dispatch[PLUS][STAR] = compare_repeat_repeat;
     dispatch[CURLY][STAR] = compare_curly_star;
     dispatch[CURLYM][STAR] = compare_curly_star;
     dispatch[CURLYX][STAR] = compare_curly_star;
     dispatch[WHILEM][STAR] = compare_left_tail;
+    dispatch[OPEN][STAR] = compare_left_open;
+    dispatch[CLOSE][STAR] = compare_left_tail;
+    dispatch[IFMATCH][STAR] = compare_after_assertion;
+    dispatch[UNLESSM][STAR] = compare_after_assertion;
     dispatch[MINMOD][STAR] = compare_left_tail;
+    dispatch[OPTIMIZED][STAR] = compare_left_tail;
 
-    for (i = 0; i < OPTIMIZED; ++i)
+    for (i = 0; i < TYPE_COUNT; ++i)
     {
 	dispatch[i][PLUS] = compare_right_plus;
     }
 
     dispatch[SUCCEED][PLUS] = compare_left_tail;
     dispatch[NOTHING][PLUS] = compare_left_tail;
+    dispatch[TAIL][PLUS] = compare_left_tail;
     dispatch[PLUS][PLUS] = compare_repeat_repeat;
     dispatch[CURLY][PLUS] = compare_curly_plus;
     dispatch[CURLYM][PLUS] = compare_curly_plus;
     dispatch[CURLYX][PLUS] = compare_curly_plus;
     dispatch[WHILEM][PLUS] = compare_left_tail;
+    dispatch[OPEN][PLUS] = compare_left_open;
+    dispatch[CLOSE][PLUS] = compare_left_tail;
+    dispatch[IFMATCH][PLUS] = compare_after_assertion;
+    dispatch[UNLESSM][PLUS] = compare_after_assertion;
     dispatch[MINMOD][PLUS] = compare_left_tail;
+    dispatch[OPTIMIZED][PLUS] = compare_left_tail;
 
-    for (i = 0; i < OPTIMIZED; ++i)
+    for (i = 0; i < TYPE_COUNT; ++i)
     {
 	dispatch[i][CURLY] = compare_right_curly;
     }
 
     dispatch[SUCCEED][CURLY] = compare_left_tail;
     dispatch[NOTHING][CURLY] = compare_left_tail;
+    dispatch[TAIL][CURLY] = compare_left_tail;
     dispatch[PLUS][CURLY] = compare_plus_curly;
     dispatch[CURLY][CURLY] = compare_curly_curly;
     dispatch[CURLYM][CURLY] = compare_curly_curly;
     dispatch[CURLYX][CURLY] = compare_curly_curly;
     dispatch[WHILEM][CURLY] = compare_left_tail;
+    dispatch[OPEN][CURLY] = compare_left_open;
+    dispatch[CLOSE][CURLY] = compare_left_tail;
+    dispatch[IFMATCH][CURLY] = compare_after_assertion;
+    dispatch[UNLESSM][CURLY] = compare_after_assertion;
     dispatch[MINMOD][CURLY] = compare_left_tail;
+    dispatch[OPTIMIZED][CURLY] = compare_left_tail;
 
-    for (i = 0; i < OPTIMIZED; ++i)
+    for (i = 0; i < TYPE_COUNT; ++i)
     {
 	dispatch[i][CURLYM] = compare_right_curly;
     }
 
     dispatch[SUCCEED][CURLYM] = compare_left_tail;
     dispatch[NOTHING][CURLYM] = compare_left_tail;
+    dispatch[TAIL][CURLYM] = compare_left_tail;
     dispatch[PLUS][CURLYM] = compare_plus_curly;
     dispatch[CURLY][CURLYM] = compare_curly_curly;
     dispatch[CURLYM][CURLYM] = compare_curly_curly;
     dispatch[CURLYX][CURLYM] = compare_curly_curly;
     dispatch[WHILEM][CURLYM] = compare_left_tail;
+    dispatch[OPEN][CURLYM] = compare_left_open;
+    dispatch[CLOSE][CURLYM] = compare_left_tail;
+    dispatch[IFMATCH][CURLYM] = compare_after_assertion;
+    dispatch[UNLESSM][CURLYM] = compare_after_assertion;
     dispatch[MINMOD][CURLYM] = compare_left_tail;
+    dispatch[OPTIMIZED][CURLYM] = compare_left_tail;
 
-    for (i = 0; i < OPTIMIZED; ++i)
+    for (i = 0; i < TYPE_COUNT; ++i)
     {
 	dispatch[i][CURLYX] = compare_right_curly;
     }
 
     dispatch[SUCCEED][CURLYX] = compare_left_tail;
     dispatch[NOTHING][CURLYX] = compare_left_tail;
+    dispatch[TAIL][CURLYX] = compare_left_tail;
     dispatch[PLUS][CURLYX] = compare_plus_curly;
     dispatch[CURLY][CURLYX] = compare_curly_curly;
     dispatch[CURLYM][CURLYX] = compare_curly_curly;
     dispatch[CURLYX][CURLYX] = compare_curly_curly;
     dispatch[WHILEM][CURLYX] = compare_left_tail;
+    dispatch[OPEN][CURLYX] = compare_left_open;
+    dispatch[CLOSE][CURLYX] = compare_left_tail;
+    dispatch[IFMATCH][CURLYX] = compare_after_assertion;
+    dispatch[UNLESSM][CURLYX] = compare_after_assertion;
     dispatch[MINMOD][CURLYX] = compare_left_tail;
+    dispatch[OPTIMIZED][CURLYX] = compare_left_tail;
 
-    for (i = 0; i < OPTIMIZED; ++i)
+    for (i = 0; i < TYPE_COUNT; ++i)
     {
 	dispatch[i][WHILEM] = compare_next;
     }
 
     dispatch[SUCCEED][WHILEM] = compare_tails;
     dispatch[NOTHING][WHILEM] = compare_tails;
+    dispatch[TAIL][WHILEM] = compare_tails;
     dispatch[WHILEM][WHILEM] = compare_tails;
+    dispatch[CLOSE][WHILEM] = compare_tails;
     dispatch[MINMOD][WHILEM] = compare_tails;
+    dispatch[OPTIMIZED][WHILEM] = compare_tails;
 
-    for (i = 0; i < OPTIMIZED; ++i)
+    for (i = 0; i < TYPE_COUNT; ++i)
+    {
+	dispatch[i][OPEN] = compare_right_open;
+    }
+
+    dispatch[OPEN][OPEN] = compare_open_open;
+
+    for (i = 0; i < TYPE_COUNT; ++i)
+    {
+	dispatch[i][CLOSE] = compare_next;
+    }
+
+    dispatch[SUCCEED][CLOSE] = compare_tails;
+    dispatch[NOTHING][CLOSE] = compare_tails;
+    dispatch[TAIL][CLOSE] = compare_tails;
+    dispatch[WHILEM][CLOSE] = compare_tails;
+    dispatch[CLOSE][CLOSE] = compare_tails;
+    dispatch[MINMOD][CLOSE] = compare_tails;
+    dispatch[OPTIMIZED][CLOSE] = compare_tails;
+
+    dispatch[SUCCEED][IFMATCH] = compare_left_tail;
+    dispatch[BOL][IFMATCH] = compare_bol;
+    dispatch[MBOL][IFMATCH] = compare_bol;
+    dispatch[SBOL][IFMATCH] = compare_bol;
+    dispatch[BOUND][IFMATCH] = compare_mismatch;
+    dispatch[NBOUND][IFMATCH] = compare_mismatch;
+    dispatch[REG_ANY][IFMATCH] = compare_mismatch;
+    dispatch[SANY][IFMATCH] = compare_mismatch;
+    dispatch[ANYOF][IFMATCH] = compare_mismatch;
+    dispatch[ALNUM][IFMATCH] = compare_mismatch;
+    dispatch[NALNUM][IFMATCH] = compare_mismatch;
+    dispatch[SPACE][IFMATCH] = compare_mismatch;
+    dispatch[NSPACE][IFMATCH] = compare_mismatch;
+    dispatch[DIGIT][IFMATCH] = compare_mismatch;
+    dispatch[NDIGIT][IFMATCH] = compare_mismatch;
+    dispatch[BRANCH][IFMATCH] = compare_mismatch;
+    dispatch[EXACT][IFMATCH] = compare_mismatch;
+    dispatch[EXACTF][IFMATCH] = compare_mismatch;
+    dispatch[NOTHING][IFMATCH] = compare_left_tail;
+    dispatch[TAIL][IFMATCH] = compare_left_tail;
+    dispatch[STAR][IFMATCH] = compare_mismatch;
+    dispatch[PLUS][IFMATCH] = compare_mismatch;
+    dispatch[CURLY][IFMATCH] = compare_mismatch;
+    dispatch[CURLYM][IFMATCH] = compare_mismatch;
+    dispatch[CURLYX][IFMATCH] = compare_mismatch;
+    dispatch[WHILEM][IFMATCH] = compare_left_tail;
+    dispatch[OPEN][IFMATCH] = compare_left_open;
+    dispatch[CLOSE][IFMATCH] = compare_left_tail;
+    dispatch[IFMATCH][IFMATCH] = compare_positive_assertions;
+    dispatch[UNLESSM][IFMATCH] = compare_mismatch;
+    dispatch[MINMOD][IFMATCH] = compare_left_tail;
+    dispatch[OPTIMIZED][IFMATCH] = compare_left_tail;
+
+    dispatch[SUCCEED][UNLESSM] = compare_left_tail;
+    dispatch[BOL][UNLESSM] = compare_bol;
+    dispatch[MBOL][UNLESSM] = compare_bol;
+    dispatch[SBOL][UNLESSM] = compare_bol;
+    dispatch[BOUND][UNLESSM] = compare_mismatch;
+    dispatch[NBOUND][UNLESSM] = compare_mismatch;
+    dispatch[REG_ANY][UNLESSM] = compare_mismatch;
+    dispatch[SANY][UNLESSM] = compare_mismatch;
+    dispatch[ANYOF][UNLESSM] = compare_mismatch;
+    dispatch[ALNUM][UNLESSM] = compare_mismatch;
+    dispatch[NALNUM][UNLESSM] = compare_mismatch;
+    dispatch[SPACE][UNLESSM] = compare_mismatch;
+    dispatch[NSPACE][UNLESSM] = compare_mismatch;
+    dispatch[DIGIT][UNLESSM] = compare_mismatch;
+    dispatch[NDIGIT][UNLESSM] = compare_mismatch;
+    dispatch[BRANCH][UNLESSM] = compare_mismatch;
+    dispatch[EXACT][UNLESSM] = compare_mismatch;
+    dispatch[EXACTF][UNLESSM] = compare_mismatch;
+    dispatch[NOTHING][UNLESSM] = compare_left_tail;
+    dispatch[TAIL][UNLESSM] = compare_left_tail;
+    dispatch[STAR][UNLESSM] = compare_mismatch;
+    dispatch[PLUS][UNLESSM] = compare_mismatch;
+    dispatch[CURLY][UNLESSM] = compare_mismatch;
+    dispatch[CURLYM][UNLESSM] = compare_mismatch;
+    dispatch[CURLYX][UNLESSM] = compare_mismatch;
+    dispatch[WHILEM][UNLESSM] = compare_left_tail;
+    dispatch[OPEN][UNLESSM] = compare_left_open;
+    dispatch[CLOSE][UNLESSM] = compare_left_tail;
+    dispatch[IFMATCH][UNLESSM] = compare_mismatch;
+    dispatch[UNLESSM][UNLESSM] = compare_negative_assertions;
+    dispatch[MINMOD][UNLESSM] = compare_left_tail;
+    dispatch[OPTIMIZED][UNLESSM] = compare_left_tail;
+
+    for (i = 0; i < TYPE_COUNT; ++i)
     {
 	dispatch[i][MINMOD] = compare_next;
     }
 
     dispatch[SUCCEED][MINMOD] = compare_tails;
     dispatch[NOTHING][MINMOD] = compare_tails;
+    dispatch[TAIL][MINMOD] = compare_tails;
     dispatch[WHILEM][MINMOD] = compare_tails;
+    dispatch[CLOSE][MINMOD] = compare_tails;
     dispatch[MINMOD][MINMOD] = compare_tails;
+    dispatch[OPTIMIZED][MINMOD] = compare_tails;
+
+    for (i = 0; i < TYPE_COUNT; ++i)
+    {
+	dispatch[i][OPTIMIZED] = compare_next;
+    }
+
+    dispatch[SUCCEED][OPTIMIZED] = compare_tails;
+    dispatch[NOTHING][OPTIMIZED] = compare_tails;
+    dispatch[TAIL][OPTIMIZED] = compare_tails;
+    dispatch[WHILEM][OPTIMIZED] = compare_tails;
+    dispatch[CLOSE][OPTIMIZED] = compare_tails;
+    dispatch[MINMOD][OPTIMIZED] = compare_tails;
+    dispatch[OPTIMIZED][OPTIMIZED] = compare_tails;
 }

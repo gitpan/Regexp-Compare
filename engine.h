@@ -15,10 +15,10 @@ extern char *rc_error;
 void rc_init();
 
 /* might croak but never returns null */
-regexp *rc_regcomp(char *rs);
+regexp *rc_regcomp(SV *rs);
 
 void rc_regfree(void *rx);
 
-int rc_compare(regnode *p1, regnode *p2);
+int rc_compare(regexp *pt1, regexp *pt2);
 
 #endif

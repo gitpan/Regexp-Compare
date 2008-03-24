@@ -15,8 +15,8 @@ rc_init();
 
 SV *
 _is_less_or_equal(rs1, rs2)
-        char *rs1;
-        char *rs2;
+        SV *rs1;
+        SV *rs2;
         CODE:
         {
 	regexp *r1 = 0, *r2 = 0;
@@ -28,7 +28,7 @@ _is_less_or_equal(rs1, rs2)
 
 	r1 = rc_regcomp(rs1);
 	r2 = rc_regcomp(rs2);
-	rv = rc_compare(r1->program, r2->program);
+	rv = rc_compare(r1, r2);
 
 	LEAVE;
 
