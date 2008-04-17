@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:                Regexp-Compare
-version:             0.07
+version:             0.08
 abstract:            partial ordering for regular expressions
 license:             ~
 author:              

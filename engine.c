@@ -1749,10 +1749,10 @@ static int compare_curly_plus(int anchored, Arrow *a1, Arrow *a2)
     p2 = a2->rn;
     assert(p2->type == PLUS);
 
-    cnt = (short *)(p2 + 1);
+    cnt = (short *)(p1 + 1);
     if (cnt[0] < 0)
     {
-	rc_error = "Negative minimum for curly";
+	rc_error = "Left curly has negative minimum";
 	return -1;
     }
 

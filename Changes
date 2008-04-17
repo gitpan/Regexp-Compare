@@ -29,4 +29,8 @@ Revision history for Perl extension Regexp::Compare.
 0.07  Mon Mar 24 14:13:23 UTC 2008
 	- support for perl 5.10
 
+0.08  Thu Apr 17 15:00:13 UTC 2008
+	- fixed bug in generic quantifier (a.k.a. curly brace) handling
+
+
 
