@@ -23,11 +23,13 @@ _is_less_or_equal(rs1, rs2)
 	int rv;
 
 	ENTER;
-	SAVEDESTRUCTOR(rc_regfree, r1);
-	SAVEDESTRUCTOR(rc_regfree, r2);
 
 	r1 = rc_regcomp(rs1);
+	SAVEDESTRUCTOR(rc_regfree, r1);
+
 	r2 = rc_regcomp(rs2);
+	SAVEDESTRUCTOR(rc_regfree, r2);
+
 	rv = rc_compare(r1, r2);
 
 	LEAVE;

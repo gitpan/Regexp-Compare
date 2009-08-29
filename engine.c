@@ -29,9 +29,11 @@
 
 /* Regexp terms are normally regnodes, except for EXACT (and EXACTF)
    nodes, which can bundle many characters, which we have to compare
-   separately. */
+   separately. Occasionally, we also need access to extra regexp
+   data. */
 typedef struct
 {
+    regexp *origin;
     regnode *rn;
     int spent;
 } Arrow;
@@ -137,6 +139,53 @@ static void init_unfolded(char *unf, char c)
     unf[1] = ((*unf >= 'a') && (*unf <= 'z')) ? *unf - 'a' + 'A' : *unf;
 }
 
+static char *get_regclass_desc(Arrow *a)
+{
+#ifdef RC_PLUGGABLE_REGEXP_ENGINE
+    regexp_internal *pr;
+#endif
+    U32 n;
+    struct reg_data *rdata;
+
+    assert(a->rn->type == ANYOF);
+    assert(a->rn->flags & ANYOF_LARGE);
+
+    /* basically copied from regexec.c:regclass_swash */
+    n = ARG_LOC(a->rn);
+#ifdef RC_PLUGGABLE_REGEXP_ENGINE
+    pr = RXi_GET(a->origin);
+    if (!pr) /* this should have been tested by find_internal during
+		initialization, but just in case... */
+    {
+	return 0;
+    }
+
+    rdata = pr->data;
+#else
+    rdata = a->origin->data;
+#endif
+    if ((n < rdata->count) &&
+	(rdata->what[n] == 's')) {
+        SV *rv = (SV *)(rdata->data[n]);
+	AV *av = (AV *)SvRV(rv);
+	SV **ary = AvARRAY(av);
+
+	/* From regcomp.c:regclass: the 0th element stores the
+	   character class description in its textual form. It isn't
+	   very clear what exactly the textual form is, but we hope
+	   it's 0-terminated. */
+	return SvPV_nolen(*ary);
+    }
+      
+    return 0;
+}
+
+static int has_named_regclass(Arrow *a, char *sought)
+{
+    char *desc = get_regclass_desc(a);
+    return desc ? !!strstr(desc, sought) : 0;
+}
+
 static int get_assertion_offset(regnode *p)
 {
     int offs;
@@ -173,7 +222,7 @@ static int get_synth_offset(regnode *p)
         /* other flags obviously exist, but they haven't been seen yet
 	   and it isn't clear what they mean */
         unsigned int unknown = p->flags & ~(ANYOF_INVERT |
-	    ANYOF_LARGE | ANYOF_UNICODE);
+	    ANYOF_LARGE | ANYOF_UNICODE | ANYOF_UNICODE_ALL);
         if (unknown)
 	{
 	    /* p[10] seems always 0 on Linux, but 0xfbfaf9f8 seen on
@@ -468,16 +517,15 @@ static int compare_tails(int anchored, Arrow *a1, Arrow *a2)
     Arrow tail1, tail2;
     int rv;
 
-    tail1.rn = a1->rn;
-    tail1.spent = a1->spent;
+    /* is it worth using StructCopy? */
+    tail1 = *a1;
     rv = bump_with_check(&tail1);
     if (rv <= 0)
     {
         return rv;
     }
 
-    tail2.rn = a2->rn;
-    tail2.spent = a2->spent;
+    tail2 = *a2;
     rv = bump_with_check(&tail2);
     if (rv <= 0)
     {
@@ -498,8 +546,7 @@ static int compare_left_tail(int anchored, Arrow *a1, Arrow *a2)
     Arrow tail1;
     int rv;
 
-    tail1.rn = a1->rn;
-    tail1.spent = a1->spent;
+    tail1 = *a1;
     rv = bump_with_check(&tail1);
     if (rv <= 0)
     {
@@ -522,6 +569,7 @@ static int compare_after_assertion(int anchored, Arrow *a1, Arrow *a2)
 	return offs;
     }
 
+    tail1.origin = a1->origin;
     tail1.rn = a1->rn + offs;
     tail1.spent = 0;
     return compare(anchored, &tail1, a2);
@@ -563,8 +611,10 @@ static int compare_positive_assertions(int anchored, Arrow *a1, Arrow *a2)
 	return -1;
     }
 
+    left.origin = a1->origin;
     left.rn = alt1;
     left.spent = 0;
+    right.origin = a2->origin;
     right.rn = alt2;
     right.spent = 0;
     rv = compare(0, &left, &right);
@@ -577,6 +627,7 @@ static int compare_positive_assertions(int anchored, Arrow *a1, Arrow *a2)
 	return rv;
     }
 
+    /* left & right.origin stays a1 & a2->origin, respectively */
     left.rn = p1 + sz1;
     left.spent = 0;
     right.rn = p2 + sz2;
@@ -620,8 +671,10 @@ static int compare_negative_assertions(int anchored, Arrow *a1, Arrow *a2)
 	return -1;
     }
 
+    left.origin = a1->origin;
     left.rn = alt1;
     left.spent = 0;
+    right.origin = a2->origin;
     right.rn = alt2;
     right.spent = 0;
     rv = compare(0, &right, &left);
@@ -634,6 +687,7 @@ static int compare_negative_assertions(int anchored, Arrow *a1, Arrow *a2)
 	return rv;
     }
 
+    /* left & right.origin stays a1 & a2->origin, respectively */
     left.rn = p1 + sz1;
     left.spent = 0;
     right.rn = p2 + sz2;
@@ -720,7 +774,7 @@ static int compare_anyof_multiline(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert((a2->rn->type == MBOL) || (a2->rn->type == MEOL));
 
-    if (a1->rn->flags & ANYOF_UNICODE)
+    if (a1->rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
     {
 	return compare_mismatch(anchored, a1, a2);
     }
@@ -735,15 +789,13 @@ static int compare_anyof_multiline(int anchored, Arrow *a1, Arrow *a2)
 	}
     }
 
-    tail1.rn = a1->rn;
-    tail1.spent = a1->spent;
+    tail1 = *a1;
     if (bump_regular(&tail1) <= 0)
     {
 	return -1;
     }
 
-    tail2.rn = a2->rn;
-    tail2.spent = a2->spent;
+    tail2 = *a2;
     if (bump_regular(&tail2) <= 0)
     {
 	return -1;
@@ -759,7 +811,9 @@ static int compare_anyof_anyof(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == ANYOF);
 
-    if (a1->rn->flags & ANYOF_UNICODE)
+    if ((a1->rn->flags & ANYOF_UNICODE) ||
+	((a1->rn->flags & ANYOF_UNICODE_ALL) &&
+	    !(a2->rn->flags & ANYOF_UNICODE_ALL)))
     {
         /* It would be nice to check at least whether the right regexp
 	   isn't the same, but it's not clear how - different Unicode
@@ -796,6 +850,27 @@ static int compare_alnum_anyof(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ALNUM);
     assert(a2->rn->type == ANYOF);
 
+    /* fprintf(stderr, "flags = 0x%x\n", a2->rn->flags); */
+
+    if (!(a2->rn->flags & ANYOF_UNICODE_ALL))
+    {
+        /* Rather specific to making old tests pass - perhaps we could
+	   generalize? */
+        int be = a2->rn->flags & ANYOF_LARGE;
+	if (be)
+	{
+	    be = has_named_regclass(a2,
+		(a2->rn->flags & ANYOF_INVERT) ?
+		     "+utf8::IsSpacePerl" :
+		     "+utf8::IsWord");
+	}
+
+	if (!be)
+	{
+	    return compare_mismatch(anchored, a1, a2);
+	}
+    }
+
     return compare_bitmaps(anchored, a1, a2, alphanumeric.bitmap, 0);
 }
 
@@ -803,6 +878,32 @@ static int compare_nalnum_anyof(int anchored, Arrow *a1, Arrow *a2)
 {
     assert(a1->rn->type == NALNUM);
     assert(a2->rn->type == ANYOF);
+
+    if (!(a2->rn->flags & ANYOF_UNICODE_ALL))
+    {
+        int be = 0;
+	if (a2->rn->flags & ANYOF_LARGE)
+	{
+	    char *desc = get_regclass_desc(a2);
+	    if (desc)
+	    {
+		if (a2->rn->flags & ANYOF_INVERT)
+		{
+		    be = !!strstr(desc, "+utf8::IsDigit") ||
+		        !!strstr(desc, "+utf8::IsWord");
+		}
+		else
+		{
+		     be = !!strstr(desc, "!utf8::IsWord");
+		}
+	    }
+	}
+
+	if (!be)
+	{
+	    return compare_mismatch(anchored, a1, a2);
+	}
+    }
 
     return compare_bitmaps(anchored, a1, a2, alphanumeric.nbitmap, 0);
 }
@@ -838,13 +939,47 @@ static int compare_digit_anyof(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == DIGIT);
     assert(a2->rn->type == ANYOF);
 
-    return compare_short_byte_class(anchored, a1, a2,  &digit);
+    if (!(a2->rn->flags & ANYOF_UNICODE_ALL))
+    {
+        int be = a2->rn->flags & ANYOF_LARGE;
+	if (be)
+	{
+	    be = has_named_regclass(a2,
+		(a2->rn->flags & ANYOF_INVERT) ?
+		     "!utf8::IsDigit" :
+		     "+utf8::IsDigit");
+	}
+
+	if (!be)
+	{
+	    return compare_mismatch(anchored, a1, a2);
+	}
+    }
+
+    return compare_bitmaps(anchored, a1, a2, digit.bitmap, 0);
 }
 
 static int compare_ndigit_anyof(int anchored, Arrow *a1, Arrow *a2)
 {
     assert(a1->rn->type == NDIGIT);
     assert(a2->rn->type == ANYOF);
+
+    if (!(a2->rn->flags & ANYOF_UNICODE_ALL))
+    {
+        int be = a2->rn->flags & ANYOF_LARGE;
+	if (be)
+	{
+	    be = has_named_regclass(a2,
+		(a2->rn->flags & ANYOF_INVERT) ?
+		     "+utf8::IsDigit" :
+		     "!utf8::IsDigit");
+	}
+
+	if (!be)
+	{
+	    return compare_mismatch(anchored, a1, a2);
+	}
+    }
 
     return compare_bitmaps(anchored, a1, a2, digit.nbitmap, 0);
 }
@@ -978,10 +1113,12 @@ static int compare_anyof_reg_any(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == REG_ANY);
 
+#if 0
     if (a1->rn->flags & ANYOF_UNICODE)
     {
 	return compare_mismatch(anchored, a1, a2);
     }
+#endif
 
     return compare_bitmaps(anchored, a1, a2, 0, ndot.nbitmap);
 }
@@ -999,7 +1136,7 @@ static int compare_anyof_alnum(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == ALNUM);
 
-    if (a1->rn->flags & ANYOF_UNICODE)
+    if (a1->rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
     {
 	return compare_mismatch(anchored, a1, a2);
     }
@@ -1012,7 +1149,7 @@ static int compare_anyof_nalnum(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == NALNUM);
 
-    if (a1->rn->flags & ANYOF_UNICODE)
+    if (a1->rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
     {
 	return compare_mismatch(anchored, a1, a2);
     }
@@ -1025,7 +1162,7 @@ static int compare_anyof_space(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == SPACE);
 
-    if (a1->rn->flags & ANYOF_UNICODE)
+    if (a1->rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
     {
 	return compare_mismatch(anchored, a1, a2);
     }
@@ -1038,7 +1175,7 @@ static int compare_anyof_nspace(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == NSPACE);
 
-    if (a1->rn->flags & ANYOF_UNICODE)
+    if (a1->rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
     {
 	return compare_mismatch(anchored, a1, a2);
     }
@@ -1051,7 +1188,7 @@ static int compare_anyof_digit(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == DIGIT);
 
-    if (a1->rn->flags & ANYOF_UNICODE)
+    if (a1->rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
     {
 	return compare_mismatch(anchored, a1, a2);
     }
@@ -1064,7 +1201,7 @@ static int compare_anyof_ndigit(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == NDIGIT);
 
-    if (a1->rn->flags & ANYOF_UNICODE)
+    if (a1->rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
     {
 	return compare_mismatch(anchored, a1, a2);
     }
@@ -1082,7 +1219,7 @@ static int compare_anyof_exact(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == EXACT);
 
-    if (a1->rn->flags & ANYOF_UNICODE)
+    if (a1->rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
     {
 	return compare_mismatch(anchored, a1, a2);
     }
@@ -1113,7 +1250,7 @@ static int compare_anyof_exactf(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == EXACTF);
 
-    if (a1->rn->flags & ANYOF_UNICODE)
+    if (a1->rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
     {
 	return compare_mismatch(anchored, a1, a2);
     }
@@ -1233,6 +1370,9 @@ static int compare_left_branch(int anchored, Arrow *a1, Arrow *a2)
 
     assert(a1->rn->type == BRANCH);
 
+    /* origins stay the same throughout the cycle */
+    left.origin = a1->origin;
+    right.origin = a2->origin;
     p1 = a1->rn;
     while (p1->type == BRANCH)
     {
@@ -1314,6 +1454,8 @@ static int compare_anyof_branch(int anchored, Arrow *a1, Arrow *a2)
     alt[0].next_off = 2;
     memcpy(alt + 2, t1, sizeof(regnode) * sz);
 
+    left.origin = a1->origin;
+    right.origin = a2->origin;
     right.rn = 0;
 
     for (i = 0; i < ANYOF_BITMAP_SIZE; ++i)
@@ -1376,6 +1518,9 @@ static int compare_right_branch(int anchored, Arrow *a1, Arrow *a2)
 
     assert(a2->rn->type == BRANCH);
 
+    /* origins stay the same throughout the cycle */
+    left.origin = a1->origin;
+    right.origin = a2->origin;
     p2 = a2->rn;
     rv = 0;
     while ((p2->type == BRANCH) && !rv)
@@ -1436,6 +1581,7 @@ static int compare_right_star(int anchored, Arrow *a1, Arrow *a2)
 	return sz;
     }
 
+    left.origin = a1->origin;
     left.rn = a1->rn;
     left.spent = a1->spent;
 
@@ -1445,6 +1591,7 @@ static int compare_right_star(int anchored, Arrow *a1, Arrow *a2)
 	return -1;
     }
 
+    right.origin = a2->origin;
     right.rn = p2 + offs;
     right.spent = 0;
 
@@ -1501,9 +1648,11 @@ static int compare_repeat_repeat(int anchored, Arrow *a1, Arrow *a2)
     p2 = a2->rn;
     assert((p2->type == PLUS) || (p2->type == STAR));
 
+    left.origin = a1->origin;
     left.rn = p1 + 1;
     left.spent = 0;
 
+    right.origin = a2->origin;
     right.rn = p2 + 1;
     right.spent = 0;
 
@@ -1532,6 +1681,7 @@ static int compare_right_curly_from_zero(int anchored, Arrow *a1, Arrow *a2)
 	return sz;
     }
 
+    left.origin = a1->origin;
     left.rn = a1->rn;
     left.spent = a1->spent;
 
@@ -1541,6 +1691,7 @@ static int compare_right_curly_from_zero(int anchored, Arrow *a1, Arrow *a2)
 	return -1;
     }
 
+    right.origin = a2->origin;
     right.rn = p2 + offs;
     right.spent = 0;
 
@@ -1649,6 +1800,7 @@ static int compare_left_plus(int anchored, Arrow *a1, Arrow *a2)
 	    /* repeat with a tail after it can be more strict than a
 	       fixed-length match only if the tail is at least as
 	       strict as the repeated regexp */
+	    left.origin = a1->origin;
 	    left.rn = q;
 	    left.spent = 0;
 
@@ -1656,6 +1808,7 @@ static int compare_left_plus(int anchored, Arrow *a1, Arrow *a2)
 	    orig_type = alt[end_offs].type;
 	    alt[end_offs].type = END;
 
+	    right.origin = a2->origin;
 	    right.rn = alt;
 	    right.spent = 0;
 
@@ -1673,6 +1826,7 @@ static int compare_left_plus(int anchored, Arrow *a1, Arrow *a2)
 	}
     }
 
+    left.origin = a1->origin;
     left.rn = alt;
     left.spent = 0;
     rv = compare(anchored, &left, a2);
@@ -1705,6 +1859,7 @@ static int compare_right_plus(int anchored, Arrow *a1, Arrow *a2)
 
     /* fprintf(stderr, "sz = %d\n", sz); */
 
+    right.origin = a2->origin;
     right.rn = p2 + 1;
     right.spent = 0;
 
@@ -1761,9 +1916,11 @@ static int compare_curly_plus(int anchored, Arrow *a1, Arrow *a2)
         return compare_mismatch(anchored, a1, a2);
     }
 
+    left.origin = a1->origin;
     left.rn = p1 + 2;
     left.spent = 0;
 
+    right.origin = a2->origin;
     right.rn = p2 + 1;
     right.spent = 0;
 
@@ -1782,9 +1939,11 @@ static int compare_curly_star(int anchored, Arrow *a1, Arrow *a2)
     p2 = a2->rn;
     assert(p2->type == STAR);
 
+    left.origin = a1->origin;
     left.rn = p1 + 2;
     left.spent = 0;
 
+    right.origin = a2->origin;
     right.rn = p2 + 1;
     right.spent = 0;
 
@@ -1822,6 +1981,7 @@ static int compare_plus_curly(int anchored, Arrow *a1, Arrow *a2)
         return compare_mismatch(anchored, a1, a2);
     }
 
+    left.origin = a1->origin;
     left.rn = p1 + 1;
     left.spent = 0;
 
@@ -1840,6 +2000,7 @@ static int compare_plus_curly(int anchored, Arrow *a1, Arrow *a2)
 	}
     }
 
+    right.origin = a2->origin;
     right.rn = p2 + 2;
     right.spent = 0;
 
@@ -1917,6 +2078,7 @@ static int compare_left_curly(int anchored, Arrow *a1, Arrow *a2)
 
 	dec_curly_counts((short *)(alt + offs - 1));
 
+	left.origin = a1->origin;
 	left.rn = alt;
 	left.spent = 0;
 	rv = compare(1, &left, a2);
@@ -1946,12 +2108,14 @@ static int compare_left_curly(int anchored, Arrow *a1, Arrow *a2)
 	    /* repeat with a tail after it can be more strict than a
 	       fixed-length match only if the tail is at least as
 	       strict as the repeated regexp */
+	    left.origin = a1->origin;
 	    left.rn = q;
 	    left.spent = 0;
 
 	    end_offs = offs - 1;
 	    alt[end_offs].type = END;
 
+	    right.origin = a2->origin;
 	    right.rn = alt;
 	    right.spent = 0;
 
@@ -1967,6 +2131,7 @@ static int compare_left_curly(int anchored, Arrow *a1, Arrow *a2)
 	}
     }
 
+    left.origin = a1->origin;
     left.rn = p1 + 2;
     left.spent = 0;
     return compare(anchored, &left, a2);
@@ -2009,6 +2174,7 @@ static int compare_right_curly(int anchored, Arrow *a1, Arrow *a2)
 
 	/* we can match it once and recurse (works for
 	   e.g. '.$' vs. '.{3}$')... */
+	right.origin = a2->origin;
 	right.rn = p2 + 2;
 	right.spent = 0;
 
@@ -2055,6 +2221,7 @@ static int compare_right_curly(int anchored, Arrow *a1, Arrow *a2)
 
 		dec_curly_counts((short *)(alt + offs - 1));
 
+		right.origin = a2->origin;
 		right.rn = alt;
 		right.spent = 0;
 
@@ -2081,6 +2248,7 @@ static int compare_right_curly(int anchored, Arrow *a1, Arrow *a2)
 	dec_curly_counts(altcnt);
 	if (altcnt[1] > 0)
 	{
+	    right.origin = a2->origin;
 	    right.rn = alt;
 	    right.spent = 0;
 
@@ -2115,8 +2283,6 @@ static int compare_curly_curly(int anchored, Arrow *a1, Arrow *a2)
     short *cnt1, *cnt2;
     int rv, offs;
 
-    /* PerlIO_printf(PerlIO_stderr(), "enter compare_curly_curly\n"); */
-
     p1 = a1->rn;
     assert((p1->type == CURLY) || (p1->type == CURLYM) ||
 	   (p1->type == CURLYX));
@@ -2143,6 +2309,7 @@ static int compare_curly_curly(int anchored, Arrow *a1, Arrow *a2)
         return compare_mismatch(anchored, a1, a2);
     }
 
+    left.origin = a1->origin;
     left.rn = p1 + 2;
     left.spent = 0;
 
@@ -2161,6 +2328,7 @@ static int compare_curly_curly(int anchored, Arrow *a1, Arrow *a2)
 	}
     }
 
+    right.origin = a2->origin;
     right.rn = p2 + 2;
     right.spent = 0;
 
@@ -2181,8 +2349,7 @@ static int compare_bound(int anchored, Arrow *a1, Arrow *a2,
 
     assert((a2->rn->type == BOUND) || (a2->rn->type == NBOUND));
 
-    left.rn = a1->rn;
-    left.spent = a1->spent;
+    left = *a1;
 
     if (bump_with_check(&left) <= 0)
     {
@@ -2197,9 +2364,9 @@ static int compare_bound(int anchored, Arrow *a1, Arrow *a2,
     }
     else if (t == ANYOF)
     {
-        /* fprintf(stderr, "next is bitmap\n"); */
+        /* fprintf(stderr, "next is bitmap; flags = 0x%x\n", left.rn->flags); */
 
-        if (a1->rn->flags & ANYOF_UNICODE)
+        if (left.rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
 	{
 	    return compare_mismatch(anchored, a1, a2);
 	}
@@ -2225,8 +2392,7 @@ static int compare_bound(int anchored, Arrow *a1, Arrow *a2,
 	return compare_mismatch(anchored, a1, a2);
     }
 
-    right.rn = a2->rn;
-    right.spent = a2->spent;
+    right = *a2;
     if (bump_with_check(&right) <= 0)
     {
 	return -1;
@@ -2309,7 +2475,7 @@ static int compare_anyof_bound(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == BOUND);
 
-    if (a1->rn->flags & ANYOF_UNICODE)
+    if (a1->rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
     {
 	return compare_mismatch(anchored, a1, a2);
     }
@@ -2322,7 +2488,7 @@ static int compare_anyof_nbound(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == NBOUND);
 
-    if (a1->rn->flags & ANYOF_UNICODE)
+    if (a1->rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
     {
 	return compare_mismatch(anchored, a1, a2);
     }
@@ -2398,7 +2564,23 @@ int rc_compare(regexp *pt1, regexp *pt2)
     }
 
 #ifdef DEBUG_dump
-    p = (unsigned char *)p1;
+    fprintf(stderr, "data: ");
+    for (i = 0; i < pt2->data->count; ++i)
+    {
+	fprintf(stderr, "%c", pt2->data->what[i]);
+    }
+
+    fprintf(stderr, "\n");
+#endif
+
+    p2 = find_internal(pt2);
+    if (!p2)
+    {
+	return -1;
+    }
+
+#ifdef DEBUG_dump
+    p = (unsigned char *)p2;
     for (i = 1; i <= 64; ++i)
     {
 	fprintf(stderr, " %02x", (int)p[i - 1]);
@@ -2411,14 +2593,10 @@ int rc_compare(regexp *pt1, regexp *pt2)
     fprintf(stderr, "\n\n");
 #endif
 
-    p2 = find_internal(pt2);
-    if (!p2)
-    {
-	return -1;
-    }
-
+    a1.origin = pt1;
     a1.rn = p1;
     a1.spent = 0;
+    a2.origin = pt2;
     a2.rn = p2;
     a2.spent = 0;
 
