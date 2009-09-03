@@ -11,7 +11,7 @@ our @ISA = qw(Exporter);
 our @EXPORT_OK = qw(is_less_or_equal);
 our @EXPORT = qw();
 
-our $VERSION = '0.09';
+our $VERSION = '0.10';
 
 require XSLoader;
 XSLoader::load('Regexp::Compare', $VERSION);
@@ -69,8 +69,6 @@ comparisons.
 =item * comparison fails for regexps with capturing parentheses
 
 =item * comparison fails for regexps with backreferences
-
-=item * comparison fails for regexps with assertions
 
 =item * global variables affecting regexp matching are ignored
 

@@ -36,3 +36,6 @@ Revision history for Perl extension Regexp::Compare.
 	- better Unicode handling
 	- updated save_destructor call for perl 5.10.1
 
+0.10  Thu Sep  3 07:00:17 UTC 2009
+	- more systematic comparison of character classes
+

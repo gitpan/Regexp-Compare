@@ -27,6 +27,23 @@
 
 #define TYPE_COUNT (OPTIMIZED + 1)
 
+#define ALNUM_BLOCK 0x0001
+#define SPACE_BLOCK 0x0002
+#define ALPHA_BLOCK 0x0004
+#define NUMBER_BLOCK 0x0008
+#define UPPER_BLOCK 0x0010
+#define LOWER_BLOCK 0x0020
+
+#define MIRROR_SHIFT 8
+#define NOT_ALNUM_BLOCK (ALNUM_BLOCK << MIRROR_SHIFT)
+#define NOT_SPACE_BLOCK (SPACE_BLOCK << MIRROR_SHIFT)
+#define NOT_ALPHA_BLOCK (ALPHA_BLOCK << MIRROR_SHIFT)
+#define NOT_NUMBER_BLOCK (NUMBER_BLOCK << MIRROR_SHIFT)
+#define NOT_UPPER_BLOCK (UPPER_BLOCK << MIRROR_SHIFT)
+#define NOT_LOWER_BLOCK (LOWER_BLOCK << MIRROR_SHIFT)
+
+#define MIRROR_BLOCK(b) ((((b) & 0xff) << MIRROR_SHIFT) | ((b) >> MIRROR_SHIFT))
+
 /* Regexp terms are normally regnodes, except for EXACT (and EXACTF)
    nodes, which can bundle many characters, which we have to compare
    separately. Occasionally, we also need access to extra regexp
@@ -180,10 +197,125 @@ static char *get_regclass_desc(Arrow *a)
     return 0;
 }
 
-static int has_named_regclass(Arrow *a, char *sought)
+static U16 get_regclass_map(char *desc, int invert)
 {
-    char *desc = get_regclass_desc(a);
-    return desc ? !!strstr(desc, sought) : 0;
+    /* ignoring the difference between IsAlnum & IsWord, which we
+       probably shouldn't... */
+    static char *names[] = { "IsSpacePerl", "IsAlnum", "IsWord",
+			     "IsAlpha", "IsDigit",
+			     "IsLower", "IsUpper" };
+    static U16 blocks[] = { SPACE_BLOCK, ALNUM_BLOCK, ALNUM_BLOCK,
+			    ALPHA_BLOCK, NUMBER_BLOCK,
+			    LOWER_BLOCK, UPPER_BLOCK };
+
+    static U16 superset[] = { NOT_SPACE_BLOCK,
+			      NOT_ALNUM_BLOCK, NOT_ALNUM_BLOCK,
+			      ALNUM_BLOCK, ALNUM_BLOCK,
+			      ALPHA_BLOCK, ALPHA_BLOCK };
+    static U16 subset[] = { ALNUM_BLOCK,
+			    NOT_ALPHA_BLOCK, NOT_NUMBER_BLOCK,
+			    ALPHA_BLOCK, NUMBER_BLOCK,
+			    UPPER_BLOCK, LOWER_BLOCK };
+
+    int i, j;
+    U16 mask = 0;
+    U16 prev_mask;
+
+    char *p = strstr(desc, "utf8::");
+
+    /* make sure *(p - 1) is valid */
+    if (p == desc)
+    {
+	p = strstr(p + 6, "utf8::");
+    }
+
+    while (p)
+    {
+        char sign = *(p - 1);
+	for (i = 0; i < SIZEOF_ARRAY(names); ++i)
+	{
+	    if (!strncmp(p + 6, names[i], strlen(names[i])))
+	    {
+		if (sign == '+')
+		{
+		    mask |= blocks[i];
+		}
+		else if (sign == '!')
+		{
+		    mask |= (blocks[i] << MIRROR_SHIFT);
+		}
+	    }
+	}
+
+	p = strstr(p + 6, "utf8::");
+    }
+
+    if ((mask & ALPHA_BLOCK) && (mask & NUMBER_BLOCK))
+    {
+	mask |= ALNUM_BLOCK;
+    }
+
+    if (invert)
+    {
+	mask = MIRROR_BLOCK(mask);
+    }
+
+    if ((mask & ALPHA_BLOCK) && (mask & NUMBER_BLOCK))
+    {
+	mask |= ALNUM_BLOCK;
+    }
+
+    /* extra cycle is inefficient but makes superset & subset
+       definitions order-independent */
+    prev_mask = 0;
+    while (mask != prev_mask)
+    {
+        prev_mask = mask;
+	for (i = 0; i < 2; ++i)
+	{
+	    for (j = 0; j < SIZEOF_ARRAY(superset); ++j)
+	    {
+		U16 b = superset[j];
+		U16 s = subset[j];
+		if (i)
+		{
+		    U16 t;
+
+		    t = MIRROR_BLOCK(b);
+		    b = MIRROR_BLOCK(s);
+		    s = t;
+		}
+
+		if (mask & b)
+		{
+		    mask |= s;
+		}
+	    }
+	}
+    }
+
+    return mask;
+}
+
+static U16 get_map(Arrow *a)
+{
+    U16 map = 0;
+
+    assert(a->rn->type == ANYOF);
+
+    if (a->rn->flags & ANYOF_LARGE)
+    {
+	char *desc = get_regclass_desc(a);
+	if (desc)
+	{
+	    /* fprintf(stderr, "desc = %s\n", desc); */
+	    map = get_regclass_map(desc,
+		!!(a->rn->flags & ANYOF_INVERT));
+	    /* fprintf(stderr, "map = 0x%x\n", map); */
+	}
+    }
+
+    return map;
 }
 
 static int get_assertion_offset(regnode *p)
@@ -811,14 +943,14 @@ static int compare_anyof_anyof(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == ANYOF);
 
-    if ((a1->rn->flags & ANYOF_UNICODE) ||
-	((a1->rn->flags & ANYOF_UNICODE_ALL) &&
-	    !(a2->rn->flags & ANYOF_UNICODE_ALL)))
+    if (((a1->rn->flags & (ANYOF_UNICODE | ANYOF_LARGE)) ||
+	(a1->rn->flags & ANYOF_UNICODE_ALL)) &&
+	!(a2->rn->flags & ANYOF_UNICODE_ALL))
     {
-        /* It would be nice to check at least whether the right regexp
-	   isn't the same, but it's not clear how - different Unicode
-	   classes compile into the same bytecode... */
-	return compare_mismatch(anchored, a1, a2);
+	if (get_map(a1) & ~get_map(a2))
+	{
+	    return compare_mismatch(anchored, a1, a2);
+	}
     }
 
     return compare_bitmaps(anchored, a1, a2, 0, 0);
@@ -854,18 +986,7 @@ static int compare_alnum_anyof(int anchored, Arrow *a1, Arrow *a2)
 
     if (!(a2->rn->flags & ANYOF_UNICODE_ALL))
     {
-        /* Rather specific to making old tests pass - perhaps we could
-	   generalize? */
-        int be = a2->rn->flags & ANYOF_LARGE;
-	if (be)
-	{
-	    be = has_named_regclass(a2,
-		(a2->rn->flags & ANYOF_INVERT) ?
-		     "+utf8::IsSpacePerl" :
-		     "+utf8::IsWord");
-	}
-
-	if (!be)
+	if (!(get_map(a2) & ALNUM_BLOCK))
 	{
 	    return compare_mismatch(anchored, a1, a2);
 	}
@@ -881,25 +1002,7 @@ static int compare_nalnum_anyof(int anchored, Arrow *a1, Arrow *a2)
 
     if (!(a2->rn->flags & ANYOF_UNICODE_ALL))
     {
-        int be = 0;
-	if (a2->rn->flags & ANYOF_LARGE)
-	{
-	    char *desc = get_regclass_desc(a2);
-	    if (desc)
-	    {
-		if (a2->rn->flags & ANYOF_INVERT)
-		{
-		    be = !!strstr(desc, "+utf8::IsDigit") ||
-		        !!strstr(desc, "+utf8::IsWord");
-		}
-		else
-		{
-		     be = !!strstr(desc, "!utf8::IsWord");
-		}
-	    }
-	}
-
-	if (!be)
+	if (!(get_map(a2) & NOT_ALNUM_BLOCK))
 	{
 	    return compare_mismatch(anchored, a1, a2);
 	}
@@ -941,16 +1044,7 @@ static int compare_digit_anyof(int anchored, Arrow *a1, Arrow *a2)
 
     if (!(a2->rn->flags & ANYOF_UNICODE_ALL))
     {
-        int be = a2->rn->flags & ANYOF_LARGE;
-	if (be)
-	{
-	    be = has_named_regclass(a2,
-		(a2->rn->flags & ANYOF_INVERT) ?
-		     "!utf8::IsDigit" :
-		     "+utf8::IsDigit");
-	}
-
-	if (!be)
+	if (!(get_map(a2) & NUMBER_BLOCK))
 	{
 	    return compare_mismatch(anchored, a1, a2);
 	}
@@ -966,16 +1060,7 @@ static int compare_ndigit_anyof(int anchored, Arrow *a1, Arrow *a2)
 
     if (!(a2->rn->flags & ANYOF_UNICODE_ALL))
     {
-        int be = a2->rn->flags & ANYOF_LARGE;
-	if (be)
-	{
-	    be = has_named_regclass(a2,
-		(a2->rn->flags & ANYOF_INVERT) ?
-		     "+utf8::IsDigit" :
-		     "!utf8::IsDigit");
-	}
-
-	if (!be)
+	if (!(get_map(a2) & NOT_NUMBER_BLOCK))
 	{
 	    return compare_mismatch(anchored, a1, a2);
 	}
