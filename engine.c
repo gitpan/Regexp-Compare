@@ -665,9 +665,19 @@ static int compare_tails(int anchored, Arrow *a1, Arrow *a2)
     }
 
     rv = compare(1, &tail1, &tail2);
+    if (rv < 0)
+    {
+        return rv;
+    }
+
     if (!rv)
     {
 	rv = compare_mismatch(anchored, a1, a2);
+    }
+    else
+    {
+	*a1 = tail1;
+	*a2 = tail2;
     }
 
     return rv;
@@ -2225,9 +2235,11 @@ static int compare_left_curly(int anchored, Arrow *a1, Arrow *a2)
 static int compare_right_curly(int anchored, Arrow *a1, Arrow *a2)
 {
     regnode *p2, *alt;
-    Arrow right;
+    Arrow left, right;
     short *cnt, *altcnt;
     int sz, rv, offs, nanch;
+
+    /* fprintf(stderr, "enter compare_right_curly(%d...: a1->spent = %d, a2->spent = %d\n", anchored, a1->spent, a2->spent); */
 
     p2 = a2->rn;
 
@@ -2238,7 +2250,7 @@ static int compare_right_curly(int anchored, Arrow *a1, Arrow *a2)
 	return -1;
     }
 
-    /* fprintf(stderr, "compare_right_curly from %d\n", cnt[0]); */
+    /* fprintf(stderr, "compare_right_curly: minimal repeat count = %d\n", cnt[0]); */
 
     nanch = anchored;
 
@@ -2257,13 +2269,12 @@ static int compare_right_curly(int anchored, Arrow *a1, Arrow *a2)
 	    return -1;
 	}
 
-	/* we can match it once and recurse (works for
-	   e.g. '.$' vs. '.{3}$')... */
 	right.origin = a2->origin;
 	right.rn = p2 + 2;
 	right.spent = 0;
 
 	rv = compare(anchored, a1, &right);
+	/* fprintf(stderr, "compare_right_curly: compare returned %d\n", rv); */
 	if (rv < 0)
 	{
 	    return rv;
@@ -2318,6 +2329,18 @@ static int compare_right_curly(int anchored, Arrow *a1, Arrow *a2)
 	    return 0;
 	}
 
+	if (cnt[0] == 1)
+	{
+	    return 1;
+	}
+
+	if (a1->rn->type == END)
+	{
+	    /* we presume the repeated argument matches something, which
+	       isn't guaranteed, but it is conservative */
+	    return 0;
+	}
+
 	/* strictly speaking, matching one repeat didn't *necessarily*
 	   anchor the match, but we'll ignore such cases as
 	   pathological */
@@ -2341,7 +2364,7 @@ static int compare_right_curly(int anchored, Arrow *a1, Arrow *a2)
 	}
 	else
 	{
-  	    rv = 1;
+	    rv = 1;
 	}
 
 	free(alt);
@@ -2354,7 +2377,6 @@ static int compare_right_curly(int anchored, Arrow *a1, Arrow *a2)
 	a2->rn += sz - 1;
 	assert(a2->rn->type == END);
 	a2->spent = 0;
-
 	return rv;
     }
 
@@ -2647,16 +2669,6 @@ int rc_compare(regexp *pt1, regexp *pt2)
     {
 	return -1;
     }
-
-#ifdef DEBUG_dump
-    fprintf(stderr, "data: ");
-    for (i = 0; i < pt2->data->count; ++i)
-    {
-	fprintf(stderr, "%c", pt2->data->what[i]);
-    }
-
-    fprintf(stderr, "\n");
-#endif
 
     p2 = find_internal(pt2);
     if (!p2)
