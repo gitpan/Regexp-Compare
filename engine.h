@@ -5,6 +5,27 @@
 #include "perl.h"
 #include "XSUB.h"
 
+#if PERL_API_REVISION != 5
+#error This module is only for Perl 5
+#else
+#if PERL_API_VERSION == 8
+typedef regexp RCRegexp;
+#else
+#if PERL_API_VERSION == 10
+#define RC_PLUGGABLE_REGEXP_ENGINE
+typedef regexp RCRegexp;
+#else
+#if PERL_API_VERSION == 12
+#define RC_PLUGGABLE_REGEXP_ENGINE
+#define RC_FIST_CLASS_REGEXP
+typedef REGEXP RCRegexp;
+#else
+#error Unsupported PERL_API_VERSION
+#endif
+#endif
+#endif
+#endif
+
 /* Set on error (i.e. failed memory allocation, unexpected regexp
    construct), used by the XS glue as an argument to croak. Value
    isn't freed - it must be a literal string. */
@@ -15,10 +36,10 @@ extern char *rc_error;
 void rc_init();
 
 /* might croak but never returns null */
-regexp *rc_regcomp(SV *rs);
+RCRegexp *rc_regcomp(SV *rs);
 
-void rc_regfree(void *rx);
+void rc_regfree(RCRegexp *rx);
 
-int rc_compare(regexp *pt1, regexp *pt2);
+int rc_compare(RCRegexp *pt1, RCRegexp *pt2);
 
 #endif

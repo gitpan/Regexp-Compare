@@ -5,18 +5,6 @@
 #include <string.h>
 #include <assert.h>
 
-#if PERL_API_REVISION != 5
-#error This module is only for Perl 5
-#else
-#if PERL_API_VERSION != 8
-#if PERL_API_VERSION == 10
-#define RC_PLUGGABLE_REGEXP_ENGINE
-#else
-#error Unsupported PERL_API_VERSION
-#endif
-#endif
-#endif
-
 #define SIZEOF_ARRAY(a) (sizeof(a) / sizeof(a[0]))
 
 #define TOLOWER(c) ((((c) >= 'A') && ((c) <= 'Z')) ? ((c) - 'A' + 'a') : (c))
@@ -570,9 +558,9 @@ static int get_jump_offset(regnode *p)
     return offs;
 }
 
-regexp *rc_regcomp(SV *rs)
+RCRegexp *rc_regcomp(SV *rs)
 {
-    regexp *rx;
+    RCRegexp *rx;
 #if !defined(RC_PLUGGABLE_REGEXP_ENGINE)
     PMOP *pm;
     char *ptr;
@@ -614,7 +602,7 @@ regexp *rc_regcomp(SV *rs)
     return rx;
 }
 
-void rc_regfree(void *rx)
+void rc_regfree(RCRegexp *rx)
 {
     if (rx)
     {
@@ -1307,7 +1295,7 @@ static int compare_anyof_ndigit(int anchored, Arrow *a1, Arrow *a2)
 static int compare_anyof_exact(int anchored, Arrow *a1, Arrow *a2)
 {
     BitFlag bf;
-    unsigned char *seq;
+    char *seq;
     int i;
     unsigned char req;
 
@@ -1320,7 +1308,7 @@ static int compare_anyof_exact(int anchored, Arrow *a1, Arrow *a2)
     }
 
     seq = GET_LITERAL(a2);
-    init_bit_flag(&bf, *seq);
+    init_bit_flag(&bf, *((unsigned char *)seq));
 
     for (i = 0; i < ANYOF_BITMAP_SIZE; ++i)
     {
@@ -1355,7 +1343,7 @@ static int compare_anyof_exactf(int anchored, Arrow *a1, Arrow *a2)
 
     for (i = 0; i < 2; ++i)
     {
-	init_bit_flag(bf + i, unf[i]);
+        init_bit_flag(bf + i, (unsigned char)(unf[i]));
     }
 
     if (bf[0].offs == bf[1].offs)
@@ -2235,7 +2223,7 @@ static int compare_left_curly(int anchored, Arrow *a1, Arrow *a2)
 static int compare_right_curly(int anchored, Arrow *a1, Arrow *a2)
 {
     regnode *p2, *alt;
-    Arrow left, right;
+    Arrow right;
     short *cnt, *altcnt;
     int sz, rv, offs, nanch;
 
@@ -2655,7 +2643,7 @@ static int success(int anchored, Arrow *a1, Arrow *a2)
 
 /* #define DEBUG_dump */
 
-int rc_compare(regexp *pt1, regexp *pt2)
+int rc_compare(RCRegexp *pt1, RCRegexp *pt2)
 {
     Arrow a1, a2;
     regnode *p1, *p2;
@@ -2664,13 +2652,21 @@ int rc_compare(regexp *pt1, regexp *pt2)
     int i;    
 #endif
 
-    p1 = find_internal(pt1);
+#ifdef RC_FIST_CLASS_REGEXP
+    a1.origin = SvANY(pt1);
+    a2.origin = SvANY(pt2);
+#else
+    a1.origin = pt1;
+    a2.origin = pt2;
+#endif
+
+    p1 = find_internal(a1.origin);
     if (!p1)
     {
 	return -1;
     }
 
-    p2 = find_internal(pt2);
+    p2 = find_internal(a2.origin);
     if (!p2)
     {
 	return -1;
@@ -2690,10 +2686,8 @@ int rc_compare(regexp *pt1, regexp *pt2)
     fprintf(stderr, "\n\n");
 #endif
 
-    a1.origin = pt1;
     a1.rn = p1;
     a1.spent = 0;
-    a2.origin = pt2;
     a2.rn = p2;
     a2.spent = 0;
 

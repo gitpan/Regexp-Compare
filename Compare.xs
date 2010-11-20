@@ -19,7 +19,7 @@ _is_less_or_equal(rs1, rs2)
         SV *rs2;
         CODE:
         {
-	regexp *r1 = 0, *r2 = 0;
+	RCRegexp *r1 = 0, *r2 = 0;
 	int rv;
 
 	ENTER;
@@ -36,7 +36,12 @@ _is_less_or_equal(rs1, rs2)
 
 	if (rv < 0)
 	{
-		croak(rc_error ? rc_error : "Regexp comparison failed");
+		if (!rc_error)
+		{
+			rc_error = "???";
+		}
+
+		croak("Regexp::Compare: %s", rc_error);
 	}
 
         RETVAL = newSViv(rv);
