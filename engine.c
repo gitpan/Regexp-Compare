@@ -555,7 +555,7 @@ static int get_jump_offset(regnode *p)
 	q += offs;
     }
 
-    return offs;
+    return q - p;
 }
 
 RCRegexp *rc_regcomp(SV *rs)
@@ -2378,6 +2378,8 @@ static int compare_curly_curly(int anchored, Arrow *a1, Arrow *a2)
     short *cnt1, *cnt2;
     int rv, offs;
 
+    /* fprintf(stderr, "enter compare_curly_curly(%d...)\n", anchored); */
+
     p1 = a1->rn;
     assert((p1->type == CURLY) || (p1->type == CURLYM) ||
 	   (p1->type == CURLYX));
@@ -2386,6 +2388,7 @@ static int compare_curly_curly(int anchored, Arrow *a1, Arrow *a2)
 	   (p2->type == CURLYX));
 
     cnt1 = (short *)(p1 + 1);
+    /* fprintf(stderr, "*cnt1 = %d\n", cnt1[0]); */
     if (cnt1[0] < 0)
     {
 	rc_error = "Negative minimum for left curly";
@@ -2393,6 +2396,7 @@ static int compare_curly_curly(int anchored, Arrow *a1, Arrow *a2)
     }
 
     cnt2 = (short *)(p2 + 1);
+    /* fprintf(stderr, "*cnt2 = %d\n", cnt2[0]); */
     if (cnt2[0] < 0)
     {
 	rc_error = "Negative minimum for right curly";
@@ -2401,6 +2405,7 @@ static int compare_curly_curly(int anchored, Arrow *a1, Arrow *a2)
 
     if (cnt2[0] > cnt1[0]) /* FIXME: fails '(?:aa){1,}' => 'a{2,}' */
     {
+        /* fprintf(stderr, "curly mismatch\n"); */
         return compare_mismatch(anchored, a1, a2);
     }
 
@@ -2411,12 +2416,14 @@ static int compare_curly_curly(int anchored, Arrow *a1, Arrow *a2)
     if (cnt1[1] > cnt2[1])
     {
 	offs = get_jump_offset(p2);
+        /* fprintf(stderr, "offs = %d\n", offs); */
 	if (offs <= 0)
 	{
 	    return -1;
 	}
 
 	e2 = p2 + offs;
+        /* fprintf(stderr, "e2->type = %d\n", e2->type); */
 	if (e2->type != END)
 	{
 	    return compare_mismatch(anchored, a1, a2);	    
@@ -2673,6 +2680,18 @@ int rc_compare(RCRegexp *pt1, RCRegexp *pt2)
     }
 
 #ifdef DEBUG_dump
+    p = (unsigned char *)p1;
+    for (i = 1; i <= 64; ++i)
+    {
+	fprintf(stderr, " %02x", (int)p[i - 1]);
+	if (!(i % 4))
+	{
+	    fprintf(stderr, "\n");
+	}
+    }
+
+    fprintf(stderr, "\n\n");
+
     p = (unsigned char *)p2;
     for (i = 1; i <= 64; ++i)
     {

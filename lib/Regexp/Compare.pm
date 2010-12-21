@@ -1,6 +1,6 @@
 package Regexp::Compare;
 
-require 5.008_007;
+require 5.008_006;
 use strict;
 use warnings;
 
@@ -11,7 +11,7 @@ our @ISA = qw(Exporter);
 our @EXPORT_OK = qw(is_less_or_equal);
 our @EXPORT = qw();
 
-our $VERSION = '0.12';
+our $VERSION = '0.13';
 
 require XSLoader;
 XSLoader::load('Regexp::Compare', $VERSION);
@@ -84,7 +84,7 @@ Vaclav Barta, E<lt>vbar@comp.czE<gt>
 Copyright (C) 2006 - 2010 by Vaclav Barta
 
 This library is free software; you can redistribute it and/or modify
-it under the same terms as Perl itself, either Perl version 5.8.7 or,
+it under the same terms as Perl itself, either Perl version 5.8.6 or,
 at your option, any later version of Perl 5 you may have available.
 
 =head1 SEE ALSO
