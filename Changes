@@ -47,3 +47,6 @@ Revision history for Perl extension Regexp::Compare.
 
 0.13  Tue Dec 21 08:46:00 UTC 2010
 	- fixed bug in curly handling (fix for https://rt.cpan.org/Public/Bug/Display.html?id=63964); many thanks to starenka for debugging support
+
+0.14  Sun Jan 16 12:55:53 UTC 2011
+	- more tests, better star handling

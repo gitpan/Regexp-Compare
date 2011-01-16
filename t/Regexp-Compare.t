@@ -24,6 +24,7 @@ BEGIN {
 	    'a' => 'a?', 'aa' => 'a?', '\\\\\\\\' => '\\\\',
 	    '\\\\' => '\\W',
 	    'a' => 'a{1,2}', 'a' => 'a*', 'aa' => 'a*', 'aaa' => 'a*',
+	    '' => 'a*',
 	    'b\\d' => 'a*b\\d', 'ac' => 'ab*c', 'a{1,2}' => 'a*',
 	    'a' => 'a+', 'aa' => 'a+', 'a?' => 'a{0,1}',
 	    'a{0,1}' => 'a?', 'aa' => 'a{2}', 'a{2}' => 'aa',
@@ -40,13 +41,14 @@ BEGIN {
 	    '(?i:a)' => '[aA]', '(?i:a)' => '[\\w]',
 	    'a(?:bcd)+' => 'a(?i:bcd)', 'ab+c' => 'ab+.',
 	    'ab(?:cd)+' => '(?:ab)+cd', '(?:ab)+cd' => 'ab(?:cd)+',
-	    'a' => 'a{1,}', 'a{1,}' => '\\w', '(?:^a){1,}' => '^a',
-	    'a+' => 'a{1,}', 'a*' => 'a{0,}', 'a{0,}' => 'a*', 'a+b' => 'ab',
+	    'a{1,}' => '\\w', '(?:^a){1,}' => '^a',
+	    'a*' => 'a{0,}', 'a{0,}' => 'a*', 'a+b' => 'ab',
 	    'ab+' => 'ab{0,}', 'ab+' => 'a+b',
 	    'ab+c' => 'ab{1,}c', 'ab{1}c' => 'abc',
 	    'ab{1}c' => 'ad*bc', 'abc' => '(?:abc){1,2}', 'abc' => 'ab+c',
-	    '(?i:abcd)' => '(?i:bc)',
-	    'b{2,3}' => 'bb', 'b{3,3}' => 'bbb', 'a{1,}b' => 'ab',
+	    '(?i:abcd)' => '(?i:bc)', 'abcdefghi' => 'bcd',
+	    'b{2,3}' => 'bb', 'b{3,3}' => 'bbb', 'bbb' => 'b{3,3}',
+	    'b{3,3}' => 'b{3}', 'b{3}' => 'b{3,3}', 'a{1,}b' => 'ab',
 	    'ab+c' => 'ab*c', 'aaa' => 'a+', 'ab' => 'a+b', 'aaab' => 'a+b',
 	    '^a+a' => '^aa', 'ab' => '(?:ab)*', 'ab' => 'a*b',
 	    'a*' => 'a*|b*', 'a*b' => '.', 'a*-' => '\\W', '1233*' => '123*',
@@ -79,7 +81,8 @@ BEGIN {
 	    '(?m:\\Aa)' => '^a', 'a\\Z' => 'a$', 'a$' => 'a\\Z',
 	    '(?m:a\\Z)' => 'a$', 'a$' => '(?m:a\\Z)',	    
 	    '(?i:abc)' => '\\w+', '(?i:abc)' => '[aA][bB][cC]',
-	    '(?:0+|1)' => '\\d+',
+	    '(?:0+|1)' => '\\d+', '[^/]*' => '[^/\\\\]*',
+            '^/[^/]*' => '^/[^/\\\\]*', '[^a]*' => '[^a-c]*', 
 	    '.' => '(?s:.)', '^a' => 'a', '^.a' => 'a', '(?s:^a)' => '^a',
 	    '^a' => '(?s:^a)', '^a' => '(?m:^a)', '(?m:^a)' => '(?m:^a)',
 	    '\\na' => '(?m:^a)', '(?m:[\\n]a)' => '(?m:^a)',
@@ -88,6 +91,7 @@ BEGIN {
 	    '[a-z]\\nb' => '(?m:^b)', 'a$' => 'a', 'a$' => 'a$',
 	    'aa$' => 'a$', '(?:abc)+$' => 'abc$', 'a$' => 'a(?:b|)',
 	    'a$' => 'a(?:b|)$', 'a[\\n]' => '(?m:a$)', 'a$' => 'a*',
+	    '(?ms:.){2}' => '(?sm:.){2}', '(?sm:.){2}' => '(?ms:.){2}',
 	    '^$' => '^$',
 	    '^a' => '\\b', '\\ba' => 'a', 'a\\b' => 'a',
 	    '^[a-c]' => '\\b\\w', '[a-z]-' => '\\b-', '[+-]\\d' => '\\b',
@@ -114,6 +118,7 @@ BEGIN {
 	    '(?:[\\w\\-_.]+\\.)?' => '(?:[-\\w\\_.]+[.])?',
 	    '(?:abc){1,2}' => '\\w', '(?:(?:abc){1,2})+' => '\\w+',
 	    '(?:(?:abc){1,2}){4}' => '\\w+',
+	    '(?:ab){2}(?:cd){1}' => '\\w*',
 	    '(?:ab{5}){1,}' => '(?:ab{4}){1,2}',
 	    '(?:(?:(?:(?:\\d){1,3})\\.){5}){1,2}' => '(?:(?:(?:(?:\\d){1,3})\\.){4}){1,2}',
 	    '(?:(?:(?:(?:\\d){1,3})\\.){5}){1,2}' => '(?:(?:(?:(?:\\d){1,3})\\.){4}){1,}',
@@ -128,6 +133,10 @@ BEGIN {
 	    'a??' => 'a?', 'a?' => 'a??', 'a??b' => 'a?b', 'a?b' => 'a??b',
 	    '(?:ab)??' => '(?:ab)*', '(?:ab)*' => '(?:ab)??',
 	    'a.*b' => 'a.*?b', 'a.*?b' => 'a.*b', '(?x:a b)' => 'ab',
+	    'ab{3}?c' => 'ab{3}c', 'ab{3}c' => 'ab{3}?c',
+	    'a{1,}?' => 'a', 'a' => 'a{1,}?',
+	    'a{1,}?b' => 'a', 'ab' => 'a{1,}?',
+	    'b{2,3}?' => 'b{2,3}', 'b{2,3}' => 'b{2,3}?',
 	    'ab' => '(?x:a b)', 'Ab' => '(?ix:a B)',
 	    "(?x:#comment\nab)" => 'ab', '(?x:[#])' => '#',
 	    '(?#before)a' => 'a(?#after)',
@@ -174,7 +183,9 @@ BEGIN {
 	    '%(?<!((?:a|b)|(?:c|d)))20' => '%20',
 	    '%(?<!((?:a|b)|(?:c|d)))20' => '2',
 	    '\\d(?<!0)ab' => 'ab',
+	    'Hi' => '(Hi(ya)?|Hello|Greetings)',
 	    '(?:casino|gambling|porn|\\bsms|milf|busty|prescription|pharmacy|penis|pills|enlarge)[\\w\\-_.]*\\.[a-z]{2,}' => '(?:busty|casino|enlarge|gambling|milf|penis|pharmacy|pills|porn|prescription|\\bsms)[\\w\\-_.]*\\.[a-z]{2,}',
+            '^(?!(master|security|tempdb)$)^[a-z0-9_]+$' => '^(?!(master|security|tempdb)$)^[a-z0-9_]+',
 	    '(?i:\\s*(?:very )?urgent\\s+(?:(?:and|&)\\s+)?\\b)' => '(?i:\\s*(?:very )?urgent\\s+(?:(?:and|&)\\s+)?\\b)',
 	    '(?i:(?:Re:|\\[.{1,10}\\])?\\s*(?:very )?urgent\\s+(?:(?:and|&)\\s+)?(?:confidential|assistance|business|attention|reply|response|help)\\b)' => '(?i:(?:Re:|\\[.{1,10}\\])?\\s*(?:very )?urgent\\s+(?:(?:and|&)\\s+)?(?:confidential|assistance|business|attention|reply|response|help)\\b)',
 	    '^contact \\S+\\@\\S+\\; run by ezmlm$' => '^contact \\S+\\@\\S+; run by ezmlm$',
@@ -185,7 +196,7 @@ BEGIN {
 	    'tast' => 't.{1,3}st', 't.st' => 't.?st',
 	    'ast' => '.*st', 'bombast' => 'b.*st',
 	    'tast' => 't(?:a|b|c)st',
-	    '[^/]*' => '[^/]*', '[^/\\\\]*' => '[^/]*',
+	    '[^/\\\\]*' => '[^/]*',
 	    '.*' => '[^\\n]*', '[^\\n]*' => '.*',
 	    '[^a-c]*' => '[^a]*', 'ab' => '(?:(?:)|.)(?:b)',
 	    'ab' => '(?:.|(?:))(?:b)'
@@ -199,82 +210,81 @@ BEGIN {
 # '(?:(?:(?:(?:\d){1,3})\\.){4}){1,2}' => '.+',
 # '\x{85}' => '\s', \x{0660} => \d
 # '.{3}$' => '.$', '.{6}$' => '...$', '(?i:abc){2}' => 'a[b]c', 
-    my %known;
-    $i = 0;
-    while ($i < scalar(@leq)) {
-	$known{$leq[$i]}->{$leq[$i + 1]} = 1;
-	$i += 2;
+
+    # Computing a transitive closure is non-trivial - OTOH a classic
+    # algorithm (Warshall) isn't that difficult to use.
+    # It works by filling up an adjacency matrix, so first we number
+    # our regexes...
+    my %rx2idx;
+    my @idx2rx;
+    my $n = 0;
+    foreach (@leq) {
+	if (!exists($rx2idx{$_})) {
+	    $rx2idx{$_} = $n++;
+	    push @idx2rx, $_;
+	}
     }
 
-    # test reflexivity
+    # ...then fill the matrix (modelled as a simple array - 2
+    # dimensions would only waste memory)
+    my @matrix = ( 0 ) x ($n * $n);
 
-    my $cnt = scalar(@leq);
+    # ...with the explicit relation...
+    my $k = 0;
+    while ($k < scalar(@leq)) {
+	$matrix[$n * $rx2idx{$leq[$k]} + $rx2idx{$leq[$k + 1]}] = 1;
+	$k += 2;
+    }
+
+    # ...as well as the implicit reflexivity.
     $i = 0;
-    while ($i < $cnt) {
-	my $rx = $leq[$i];
-	if (!exists($known{$rx}) ||
-	    !exists($known{$rx}->{$rx})) {
-	    $known{$rx}->{$rx} = 1;
+    while ($i < $n) {
+        $matrix[$n * $i + $i] = 1;
 
-	    # 20May2006: push causes missing transitivity tests -
-	    # that's clearly a bug in the generator below, but it
-	    # isn't clear where exactly...
-	    unshift @leq, ($rx, $rx);
+        ++$i;
+    }
+
+    # Then we do the Warshall algorithm...
+    my $j = 0;
+    while ($j < $n) {
+        $i = 0;
+	while ($i < $n) {
+	    if ($matrix[$n * $i + $j]) {
+	        $k = 0;
+		while ($k < $n) {
+		    $matrix[$n * $i + $k] ||= $matrix[$n * $j + $k];
+
+		    ++$k;
+		}
+	    }
+
+	    ++$i;
+	}
+
+        ++$j;
+    }
+
+    # ...and translate the transitive closure back from indices to
+    # regexp strings.
+    @leq = ();
+    $i = 0;
+    while ($i < $n) {
+	$j = 0;
+	while ($j < $n) {
+	    if ($matrix[$n * $i + $j]) {
+		push @leq, $idx2rx[$i];
+		push @leq, $idx2rx[$j];
+	    }
+
+	    ++$j;
 	}
 
 	++$i;
     }
 
-    # test transitivity
-
-    my $double = 0;
-    my %chain;
-    while ($double < scalar(@leq)) {
-	$double = scalar(@leq);
-
-	%chain = ();
-	$i = 0;
-	while ($i < $double) {
-	    $chain{$leq[$i + 1]} = {
-				    left => $leq[$i],
-				    right => { }
-				   };
-	    $i += 2;
-	}
-
-	$i = 0;
-	while ($i < $double) {
-	    if (exists($chain{$leq[$i]})) {
-		$chain{$leq[$i]}->{right}->{$leq[$i + 1]} = 1;
-	    }
-
-	    $i += 2;
-	}
-
-	$i = 0;
-	while ($i < $double) {
-	    delete $chain{$leq[$i + 1]}->{right}->{$leq[$i + 1]};
-	    if (!scalar(keys %{$chain{$leq[$i + 1]}->{right}})) {
-		delete $chain{$leq[$i + 1]};
-	    }
-
-	    $i += 2;
-	}
-
-	foreach my $t (sort keys %chain) {
-	    my $l = $chain{$t}->{left};
-	    foreach my $r (sort keys %{$chain{$t}->{right}}) {
-		if (!exists($known{$l}) ||
-		    !exists($known{$l}->{$r})) {
-		    $known{$l}->{$r} = 1;
-		    push @leq, ($l, $r);
-		}
-	    }
-	}
-    }
-
     @nc = (
-	   '' => 'a', 'a' => 'aa', 'a' => 'b', 'abc' => 'ac', 'abcd' => 'bd',
+	   '' => 'a', '' => 'a+', 'a' => 'aa', 'a' => 'b', 'abc' => 'ac',
+           'abcd' => 'bd', 'ab*c' => 'ab*d',
 	   '[ab]' => 'ab', '.' => 'a',	'.' => '[a]',
 	   '(?s:.)' => '[^\\n]', '\\d' => '[a]', 'a' => '\\d', 'a' => '\\s',
 	   '\\d' => '[23]', '\\d' => '4', '.' => '\\d', '\\s' => 'a',
@@ -300,7 +310,7 @@ BEGIN {
 	   'a[bc]de' => '[bc]e', 'a' => '^a', '[a-z]' => '^a',
 	   'a*' => 'a', 'a*' => 'a+', 'xa{1,}y' => 'xay',
 	   'a+' => 'a{2,}', 'ab+c' => 'abc', 'a+' => 'aaa',
-	   'ab+c' => 'a+bc',
+	   'ab+c' => 'a+bc', '(:?ab){2}' => '(?:ab){3,}',
 	   '(?:^a)*' => '^a', 'ab+c' => 'ab{2,}c', 'ab{1,}c' => 'abc',
 	   '^-' => '\\b', '[a ]' => '\\b', 'a' => '\\ba',
 	   '\\B' => '\\b', '\\b' => '\\B', '\\b[a ]' => '(?:\\b[a ]){2}',
@@ -309,7 +319,7 @@ BEGIN {
 	   'a+' => 'b{1,}', 'abc' => 'a*bd', '(?i:a)' => 'a',
 	   'a(?:b|)c' => 'ac', '[abc]' => 'a|b', 'a|b' => 'a',
 	   '.$' => '.{3}$', '...$' => '.{6}$', '^a' => 'a$', 'a$' => '^a',
-	   'a*' => 'a$',
+	   'a*' => 'a$', 'abcabc' => '(?:abc){3}',
 	   'a{2}' => 'ab', 'ab' => 'a{2}', '\\w' => '.{2}',
 	   '\\S' => '.{2}', '\\d' => '.{2}', '.' => '(?s:.){2}',
 	   '(?s:.)' => '(?s:.){2}', '[a-z]' => '(?s:.){2}',
@@ -325,9 +335,11 @@ BEGIN {
 	   '(?:ab{4}){1,2}' => '(?:ab{5}){1,}',
 	   '(?:ab{5}){1,}c' => '(?:ab{4}){1,2}c',
 	   '(?:ab{5}){1,}' => '(?:ab{4}c){1,2}',
+	   'a{1,}?' => 'ab', 'a' => 'a{1,}?b',
 	   '(?:(?:(?:(?:\\d){1,3})\\.){4}){1,2}' => '(?:(?:(?:(?:\\d){1,3})\\.){5}){1,2}',
 	    '(?:(?:(?:(?:\\d){1,3})\\.){5}){1,2}' => '(?:(?:(?:(?:\\d){1,3})\\.){4}){3,}',
 	   '(?:busty|casino|enlarge|gambling|milf|penis)' => '(?:busty|enlarge|milf)',
+	   '^(?!(master|security|tempdb)$)^[a-z0-9_]+' => '^(?!(master|security|tempdb)$)^[a-z0-9_]+$',
 	   '(?:[\\w\\-_.]+\\.)?(?:l(?:so|os)tr)\\.[a-z]{2,}' => '(?:[\\w\\-_.]+\\.)?(?:l(?:so|os)tr)\\. ',
 	   't.st' => 'ta*st',
 	   '(?=[ab])' => '^(?=(a|b))', '^(?=(a|b)).' => '(?=[ab])..',
@@ -337,11 +349,11 @@ BEGIN {
 	   '(?<!((?:a|b)|(?:c|d)))%20' => '%21',
 	   '(?<!\\d\\d)%20' => '(?<!\\d)%20', '(?<!\\w)b' => '(?<=\\w)b',
 	   '(?<=\\w)b' => '(?<!\\w)b',
-	   '[^/]*' => '[^/\\\\]*', '(?ix:a B)' => 'Ab',
+	   '[^/]+' => '[^/\\\\]+', '(?ix:a B)' => 'Ab',
 	   'x(?:ab)*y' => 'x(?:ab)??y', '\x{263a}+' => ' +',
-	   ' +' => '[\x{263a}]+',
-	   '[^a]*' => '[^a-c]*', '(?:(?:)|.)(?:b)' => 'ab',
-	   '(?:.|(?:))(?:b)' => 'ab'
+	   ' +' => '[\x{263a}]+', '(:?a+a+){3}b' => '(:?a+a+){4}b',
+	   '[^a]*' => '[^a-c]+', 'a[^b]*$' => 'a[^bc]*$',
+	   '(?:(?:)|.)(?:b)' => 'ab', '(?:.|(?:))(?:b)' => 'ab'
 	  );
 
     @invalid = ( 'a' => '[a', 'a{2,1}' => 'a' );

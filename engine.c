@@ -614,7 +614,7 @@ static int compare_mismatch(int anchored, Arrow *a1, Arrow *a2)
 {
     int rv;
 
-    /* fprintf(stderr, "enter compare_mismatch(%d\n", anchored); */
+    /* fprintf(stderr, "enter compare_mismatch(%d...)\n", anchored); */
 
     if (anchored)
     {
@@ -1039,6 +1039,8 @@ static int compare_digit_anyof(int anchored, Arrow *a1, Arrow *a2)
 
     assert(a1->rn->type == DIGIT);
     assert(a2->rn->type == ANYOF);
+
+    /* fprintf(stderr, "right flags = %d\n", a2->rn->flags); */
 
     if (!(a2->rn->flags & ANYOF_UNICODE_ALL))
     {
@@ -1721,15 +1723,15 @@ static int compare_right_star(int anchored, Arrow *a1, Arrow *a2)
     return rv;
 }
 
-static int compare_repeat_repeat(int anchored, Arrow *a1, Arrow *a2)
+static int compare_plus_plus(int anchored, Arrow *a1, Arrow *a2)
 {
     regnode *p1, *p2;
     Arrow left, right;
 
     p1 = a1->rn;
-    assert((p1->type == PLUS) || (p1->type == STAR));
+    assert(p1->type == PLUS);
     p2 = a2->rn;
-    assert((p2->type == PLUS) || (p2->type == STAR));
+    assert(p2->type == PLUS);
 
     left.origin = a1->origin;
     left.rn = p1 + 1;
@@ -1739,6 +1741,47 @@ static int compare_repeat_repeat(int anchored, Arrow *a1, Arrow *a2)
     right.rn = p2 + 1;
     right.spent = 0;
 
+    return compare(1, &left, &right);
+}
+
+static int compare_repeat_star(int anchored, Arrow *a1, Arrow *a2)
+{
+    regnode *p1, *p2;
+    Arrow left, right;
+    int rv, offs;
+
+    p1 = a1->rn;
+    assert((p1->type == PLUS) || (p1->type == STAR));
+    p2 = a2->rn;
+    assert(p2->type == STAR);
+    /* fprintf(stderr, "enter compare_repeat_star(%d, %d, %d)\n",
+       anchored, p1->type, p2->type); */
+
+    left.origin = a1->origin;
+    left.rn = p1 + 1;
+    left.spent = 0;
+
+    right.origin = a2->origin;
+    right.rn = p2 + 1;
+    right.spent = 0;
+
+    rv = compare(1, &left, &right);
+    /* fprintf(stderr, "inclusive compare returned %d\n", rv); */
+    if (rv)
+    {
+	return rv;
+    }
+
+    offs = GET_OFFSET(p2);
+    /* fprintf(stderr, "offs = %d\n", offs); */
+    if (offs <= 0)
+    {
+	return -1;
+    }
+
+    right.origin = a2->origin;
+    right.rn = p2 + offs;
+    right.spent = 0;
     return compare(1, &left, &right);
 }
 
@@ -2007,7 +2050,12 @@ static int compare_curly_plus(int anchored, Arrow *a1, Arrow *a2)
     right.rn = p2 + 1;
     right.spent = 0;
 
-    return compare(1, &left, &right);
+    if (cnt[0] > 1)
+    {
+	anchored = 1;
+    }
+
+    return compare(anchored, &left, &right);
 }
 
 static int compare_curly_star(int anchored, Arrow *a1, Arrow *a2)
@@ -2435,7 +2483,8 @@ static int compare_curly_curly(int anchored, Arrow *a1, Arrow *a2)
     right.spent = 0;
 
     /* fprintf(stderr, "comparing tails\n"); */
-    rv = compare(1, &left, &right);
+
+    rv = compare(anchored, &left, &right);
     /* fprintf(stderr, "tail compare returned %d\n", rv); */
     return (!rv && !cnt2[0]) ? compare_next(anchored, a1, a2) : rv;
 }
@@ -3420,8 +3469,8 @@ void rc_init()
     dispatch[SEOL][STAR] = compare_tails;
     dispatch[NOTHING][STAR] = compare_left_tail;
     dispatch[TAIL][STAR] = compare_left_tail;
-    dispatch[STAR][STAR] = compare_repeat_repeat;
-    dispatch[PLUS][STAR] = compare_repeat_repeat;
+    dispatch[STAR][STAR] = compare_repeat_star;
+    dispatch[PLUS][STAR] = compare_repeat_star;
     dispatch[CURLY][STAR] = compare_curly_star;
     dispatch[CURLYM][STAR] = compare_curly_star;
     dispatch[CURLYX][STAR] = compare_curly_star;
@@ -3441,7 +3490,7 @@ void rc_init()
     dispatch[SUCCEED][PLUS] = compare_left_tail;
     dispatch[NOTHING][PLUS] = compare_left_tail;
     dispatch[TAIL][PLUS] = compare_left_tail;
-    dispatch[PLUS][PLUS] = compare_repeat_repeat;
+    dispatch[PLUS][PLUS] = compare_plus_plus;
     dispatch[CURLY][PLUS] = compare_curly_plus;
     dispatch[CURLYM][PLUS] = compare_curly_plus;
     dispatch[CURLYX][PLUS] = compare_curly_plus;
