@@ -146,18 +146,19 @@ static void init_unfolded(char *unf, char c)
 
 static char *get_regclass_desc(Arrow *a)
 {
-#ifdef RC_PLUGGABLE_REGEXP_ENGINE
     regexp_internal *pr;
-#endif
     U32 n;
     struct reg_data *rdata;
 
     assert(a->rn->type == ANYOF);
+#ifndef RC_DEFAULT_UNICODE
     assert(a->rn->flags & ANYOF_LARGE);
+#else
+    assert(ANYOF_NONBITMAP(a->rn));
+#endif
 
     /* basically copied from regexec.c:regclass_swash */
     n = ARG_LOC(a->rn);
-#ifdef RC_PLUGGABLE_REGEXP_ENGINE
     pr = RXi_GET(a->origin);
     if (!pr) /* this should have been tested by find_internal during
 		initialization, but just in case... */
@@ -166,9 +167,7 @@ static char *get_regclass_desc(Arrow *a)
     }
 
     rdata = pr->data;
-#else
-    rdata = a->origin->data;
-#endif
+
     if ((n < rdata->count) &&
 	(rdata->what[n] == 's')) {
         SV *rv = (SV *)(rdata->data[n]);
@@ -187,14 +186,14 @@ static char *get_regclass_desc(Arrow *a)
 
 static U16 get_regclass_map(char *desc, int invert)
 {
-    /* ignoring the difference between IsAlnum & IsWord, which we
-       probably shouldn't... */
+    /* ignoring the difference between classes (i.e. IsAlnum &
+       IsWord), which we probably shouldn't... */
     static char *names[] = { "IsSpacePerl", "IsAlnum", "IsWord",
-			     "IsAlpha", "IsDigit",
-			     "IsLower", "IsUpper" };
+			     "IsXPosixAlnum", "IsAlpha", "IsXPosixAlpha",
+			     "IsDigit", "IsLower", "IsUpper" };
     static U16 blocks[] = { SPACE_BLOCK, ALNUM_BLOCK, ALNUM_BLOCK,
-			    ALPHA_BLOCK, NUMBER_BLOCK,
-			    LOWER_BLOCK, UPPER_BLOCK };
+			    ALNUM_BLOCK, ALPHA_BLOCK, ALPHA_BLOCK,
+			    NUMBER_BLOCK, LOWER_BLOCK, UPPER_BLOCK };
 
     static U16 superset[] = { NOT_SPACE_BLOCK,
 			      NOT_ALNUM_BLOCK, NOT_ALNUM_BLOCK,
@@ -289,9 +288,14 @@ static U16 get_map(Arrow *a)
 {
     U16 map = 0;
 
+    /* fprintf(stderr, "enter get_map\n"); */
     assert(a->rn->type == ANYOF);
 
+#ifndef RC_DEFAULT_UNICODE
     if (a->rn->flags & ANYOF_LARGE)
+#else
+    if (ANYOF_NONBITMAP(a->rn))
+#endif
     {
 	char *desc = get_regclass_desc(a);
 	if (desc)
@@ -385,14 +389,10 @@ static int get_size(regnode *rn)
 
 static regnode *find_internal(regexp *pt)
 {
-#ifdef RC_PLUGGABLE_REGEXP_ENGINE
     regexp_internal *pr;
-#endif
     regnode *p;
 
     assert(pt);
-
-#ifdef RC_PLUGGABLE_REGEXP_ENGINE
 
 /* ActivePerl Build 1001 doesn't export PL_core_reg_engine, so
    the test, however useful, wouldn't link... */
@@ -412,9 +412,6 @@ static regnode *find_internal(regexp *pt)
     }
 
     p = pr->program;
-#else
-    p = pt->program;
-#endif
     if (!p)
     {
         rc_error = "Compiled regexp not set";
@@ -561,43 +558,17 @@ static int get_jump_offset(regnode *p)
 RCRegexp *rc_regcomp(SV *rs)
 {
     RCRegexp *rx;
-#if !defined(RC_PLUGGABLE_REGEXP_ENGINE)
-    PMOP *pm;
-    char *ptr;
-    STRLEN len;
-#endif
 
     if (!rs)
     {
 	croak("No regexp to compare");
     }
 
-#if !defined(RC_PLUGGABLE_REGEXP_ENGINE)
-    Newz(1, pm, 1, PMOP);
-    if (pm == 0)
-    {
-        croak("Couldn't allocate memory for PMOP");
-    }
-
-    ptr = SvPV(rs, len);
-
-    ENTER;
-    SAVEDESTRUCTOR(safefree, pm);
-
-    rx = pregcomp(ptr, ptr + len, pm);
-    if (!rx)
-    {
-	croak("Cannot compile regexp");
-    }
-
-    LEAVE;
-#else
     rx = pregcomp(rs, 0);
     if (!rx)
     {
 	croak("Cannot compile regexp");
     }
-#endif
 
     return rx;
 }
@@ -872,12 +843,21 @@ static int compare_bitmaps(int anchored, Arrow *a1, Arrow *a2,
     unsigned char *b1, unsigned char *b2)
 {
     unsigned char loc1, loc2;
-    int i;
+    int i, sz;
 
     /* fprintf(stderr, "enter compare_bitmaps(%d, %d, %d)\n", anchored,
         a1->rn->type, a2->rn->type); */
 
-    for (i = 0; i < ANYOF_BITMAP_SIZE; ++i)
+#ifndef RC_DEFAULT_UNICODE
+    sz = ANYOF_BITMAP_SIZE;
+#else
+    sz = (((a1->rn->flags & ANYOF_INVERT) &&
+	    (a1->rn->flags & ANYOF_NON_UTF8_LATIN1_ALL)) ||
+	(!(a2->rn->flags & ANYOF_INVERT) &&
+	    (a2->rn->flags & ANYOF_NON_UTF8_LATIN1_ALL))) ? 16
+        : ANYOF_BITMAP_SIZE;
+#endif
+    for (i = 0; i < sz; ++i)
     {
         loc1 = b1 ? b1[i] : get_bitmap_byte(a1->rn, i); 
         loc2 = b2 ? b2[i] : get_bitmap_byte(a2->rn, i); 
@@ -936,13 +916,19 @@ static int compare_anyof_multiline(int anchored, Arrow *a1, Arrow *a2)
 
 static int compare_anyof_anyof(int anchored, Arrow *a1, Arrow *a2)
 {
+    int extra_left;
+
     /* fprintf(stderr, "enter compare_anyof_anyof(%d\n", anchored); */
 
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == ANYOF);
 
-    if (((a1->rn->flags & (ANYOF_UNICODE | ANYOF_LARGE)) ||
-	(a1->rn->flags & ANYOF_UNICODE_ALL)) &&
+#ifndef RC_DEFAULT_UNICODE
+    extra_left = a1->rn->flags & (ANYOF_UNICODE | ANYOF_LARGE);
+#else
+    extra_left = ANYOF_NONBITMAP(a1->rn);
+#endif
+    if ((extra_left || (a1->rn->flags & ANYOF_UNICODE_ALL)) &&
 	!(a2->rn->flags & ANYOF_UNICODE_ALL))
     {
 	if (get_map(a1) & ~get_map(a2))

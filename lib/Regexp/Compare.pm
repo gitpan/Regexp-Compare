@@ -1,6 +1,6 @@
 package Regexp::Compare;
 
-require 5.008_006;
+require 5.010_001;
 use strict;
 use warnings;
 
@@ -11,7 +11,7 @@ our @ISA = qw(Exporter);
 our @EXPORT_OK = qw(is_less_or_equal);
 our @EXPORT = qw();
 
-our $VERSION = '0.14';
+our $VERSION = '0.15';
 
 require XSLoader;
 XSLoader::load('Regexp::Compare', $VERSION);
@@ -64,6 +64,9 @@ comparisons.
 
 =over
 
+=item * comparison of character classes is simplified and probably has
+some incorrect corner cases
+
 =item * comparison fails for locale-specific constructs
 
 =item * comparison fails for regexps with backreferences
@@ -84,7 +87,7 @@ Vaclav Barta, E<lt>vbar@comp.czE<gt>
 Copyright (C) 2006 - 2011 by Vaclav Barta
 
 This library is free software; you can redistribute it and/or modify
-it under the same terms as Perl itself, either Perl version 5.8.6 or,
+it under the same terms as Perl itself, either Perl version 5.10.1 or,
 at your option, any later version of Perl 5 you may have available.
 
 =head1 SEE ALSO

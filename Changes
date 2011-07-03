@@ -50,3 +50,7 @@ Revision history for Perl extension Regexp::Compare.
 
 0.14  Sun Jan 16 12:55:53 UTC 2011
 	- more tests, better star handling
+
+0.15  Sun Jul  3 07:02:38 UTC 2011
+	- added support for perl 5.14, removed support for perl 5.8
+

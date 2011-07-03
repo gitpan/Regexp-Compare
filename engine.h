@@ -8,16 +8,17 @@
 #if PERL_API_REVISION != 5
 #error This module is only for Perl 5
 #else
-#if PERL_API_VERSION == 8
-typedef regexp RCRegexp;
-#else
 #if PERL_API_VERSION == 10
-#define RC_PLUGGABLE_REGEXP_ENGINE
 typedef regexp RCRegexp;
 #else
 #if PERL_API_VERSION == 12
-#define RC_PLUGGABLE_REGEXP_ENGINE
 #define RC_FIST_CLASS_REGEXP
+typedef REGEXP RCRegexp;
+#else
+#if PERL_API_VERSION == 14
+#define RC_FIST_CLASS_REGEXP
+#define RC_DEFAULT_UNICODE
+#define ANYOF_UNICODE 0
 typedef REGEXP RCRegexp;
 #else
 #error Unsupported PERL_API_VERSION
