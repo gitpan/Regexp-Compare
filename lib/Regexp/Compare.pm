@@ -11,7 +11,7 @@ our @ISA = qw(Exporter);
 our @EXPORT_OK = qw(is_less_or_equal);
 our @EXPORT = qw();
 
-our $VERSION = '0.15';
+our $VERSION = '0.16';
 
 require XSLoader;
 XSLoader::load('Regexp::Compare', $VERSION);
@@ -63,6 +63,8 @@ comparisons.
 =head1 BUGS
 
 =over
+
+=item * EBCDIC-based platforms not supported
 
 =item * comparison of character classes is simplified and probably has
 some incorrect corner cases

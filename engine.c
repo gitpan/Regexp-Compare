@@ -30,6 +30,10 @@
 #define NOT_UPPER_BLOCK (UPPER_BLOCK << MIRROR_SHIFT)
 #define NOT_LOWER_BLOCK (LOWER_BLOCK << MIRROR_SHIFT)
 
+#define FORCED_BYTE 0x01
+#define FORCED_CHAR 0x02
+#define FORCED_MISMATCH (FORCED_BYTE | FORCED_CHAR)
+
 #define MIRROR_BLOCK(b) ((((b) & 0xff) << MIRROR_SHIFT) | ((b) >> MIRROR_SHIFT))
 
 /* Regexp terms are normally regnodes, except for EXACT (and EXACTF)
@@ -75,6 +79,8 @@ typedef struct
 
 char *rc_error = 0;
 
+unsigned char forced_byte[ANYOF_BITMAP_SIZE];
+
 /* matching \s i.e. not including \v - see perlre */
 static char whitespace_expl[] = { ' ', '\f', '\n', '\r', '\t' };
 
@@ -112,6 +118,27 @@ static void init_bit_flag(BitFlag *bf, int c)
 
     bf->offs = c / 8;
     bf->mask = 1 << (c % 8);
+}
+
+static void init_forced_byte()
+{
+    char forced_byte_expl[] = { 'a', 'b', 'c', 'e', 'f', 'x' };
+    BitFlag bf;
+    int i;
+
+    memset(forced_byte, 0, sizeof(forced_byte));
+
+    for (i = 0; i < sizeof(forced_byte_expl); ++i)
+    {
+	init_bit_flag(&bf, (unsigned char)forced_byte_expl[i]);
+	forced_byte[bf.offs] |= bf.mask;
+    }
+
+    for (i = 0; i < 8; ++i)
+    {
+	init_bit_flag(&bf, (unsigned char)('0' + i));
+	forced_byte[bf.offs] |= bf.mask;
+    }
 }
 
 static void init_byte_class(ByteClass *bc, char *expl, int expl_size)
@@ -387,10 +414,16 @@ static int get_size(regnode *rn)
     return e - rn + 1;
 }
 
+/* #define DEBUG_dump_data */
+
 static regnode *find_internal(regexp *pt)
 {
     regexp_internal *pr;
     regnode *p;
+#ifdef DEBUG_dump_data
+    struct reg_data *rdata;
+    int n;
+#endif
 
     assert(pt);
 
@@ -426,7 +459,134 @@ static regnode *find_internal(regexp *pt)
 	return 0;
     }
 
+#ifdef DEBUG_dump_data
+    rdata = pr->data;
+    if (rdata)
+    {
+        fprintf(stderr, "regexp data count = %d\n", (int)(rdata->count));
+	for (n = 0; n < rdata->count; ++n)
+	{
+	    fprintf(stderr, "\twhat[%d] = %c\n", n, rdata->what[n]);
+	}
+    }
+    else
+    {
+	fprintf(stderr, "no regexp data\n");
+    }
+#endif
+
     return p + 1;
+}
+
+static unsigned char parse_hex_digit(char d)
+{
+    unsigned char rv;
+
+    d = tolower(d);
+
+    if (('0' <= d) && (d <= '9'))
+    {
+        rv = d - '0';
+    }
+    else
+    {
+	rv = 10 + (d - 'a');
+    }
+
+    return rv;
+}
+
+static unsigned char parse_hex_byte(const char *first)
+{
+    return 16 * parse_hex_digit(*first) +
+        parse_hex_digit(first[1]);
+}
+
+static unsigned get_forced_semantics(REGEXP *pt)
+{
+    const char *precomp = RX_PRECOMP(pt);
+    U32 prelen = RX_PRELEN(pt);
+    int quoted = 0;
+    int matched;
+    unsigned forced = 0;
+    U32 i;
+    BitFlag bf;
+    char c;
+
+    /* fprintf(stderr, "precomp = %*s\n", (int)prelen, precomp); */
+
+    for (i = 0; i < prelen; ++i)
+    {
+	c = precomp[i];
+	if (!quoted)
+	{
+	    /* technically, the backslash might be in a comment, but
+	       parsing that is too much hassle */
+	    if (c == '\\')
+	    {
+		quoted = 1;
+	    }
+	}
+	else
+	{
+	    matched = 0;
+
+	    if (c == 'N')
+	    {
+	        /* we have special cases only for \r & \n... */
+	        if ((i + 8 < prelen) &&
+		    !memcmp(precomp + i + 1, "{U+00", 5) &&
+		    isxdigit(precomp[i + 6]) && isxdigit(precomp[i + 7]) &&
+		    (precomp[i + 8] == '}'))
+		{
+		    unsigned char x = parse_hex_byte(precomp + i + 6);
+		    if ((x != '\r') && (x != '\n'))
+		    {
+			forced |= FORCED_CHAR;
+		    }
+
+		    i += 8;
+		}
+		else
+		{
+		    forced |= FORCED_CHAR;
+		}
+
+	        matched = 1;
+	    }
+	    else if (c == 'x')
+	    {
+	        if ((i + 2 < prelen) &&
+		    isxdigit(precomp[i + 1]) && isxdigit(precomp[i + 2]))
+		{
+		    unsigned char x = parse_hex_byte(precomp + i + 1);
+		    if ((x != '\r') && (x != '\n'))
+		    {
+			forced |= FORCED_BYTE;
+		    }
+
+		    matched = 1;
+		    i += 2;
+		}
+	    }
+
+	    /* ...and we aren't bothering to parse octal numbers
+	       and \x{n+} at all... */
+
+	    if (!matched)
+	    {
+		init_bit_flag(&bf, (unsigned char)c);
+		if (forced_byte[bf.offs] & bf.mask)
+		{
+		    forced |= FORCED_BYTE;
+		}
+	    }
+
+	    quoted = 0;
+	}
+    }
+
+    return forced;
 }
 
 static regnode *alloc_alt(regnode *p, int sz)
@@ -2702,6 +2862,11 @@ int rc_compare(RCRegexp *pt1, RCRegexp *pt2)
     a2.origin = pt2;
 #endif
 
+    if ((get_forced_semantics(pt1) | get_forced_semantics(pt2)) == FORCED_MISMATCH)
+    {
+	return 0;
+    }
+
     p1 = find_internal(a1.origin);
     if (!p1)
     {
@@ -2779,6 +2944,8 @@ void rc_init()
        making it compatible... */
     assert(ANYOF_BITMAP_SIZE == 32);
 
+    init_forced_byte();
+
     init_byte_class(&whitespace, whitespace_expl,
         SIZEOF_ARRAY(whitespace_expl));
 
@@ -2817,7 +2984,8 @@ void rc_init()
     memset(non_alphanumeric_classes, 0,
 	SIZEOF_ARRAY(non_alphanumeric_classes));
     non_alphanumeric_classes[NALNUM] = non_alphanumeric_classes[SPACE] = 
-        non_alphanumeric_classes[EOL] = non_alphanumeric_classes[SEOL] = 1;
+        non_alphanumeric_classes[EOS] = non_alphanumeric_classes[EOL] = 
+        non_alphanumeric_classes[SEOL] = 1;
 
     memset(trivial_nodes, 0, SIZEOF_ARRAY(trivial_nodes));
     trivial_nodes[SUCCEED] = trivial_nodes[NOTHING] =
@@ -2906,7 +3074,28 @@ void rc_init()
     dispatch[MINMOD][SBOL] = compare_left_tail;
     dispatch[OPTIMIZED][SBOL] = compare_left_tail;
 
+    dispatch[SUCCEED][EOS] = compare_left_tail;
+    dispatch[EOS][EOS] = compare_tails;
+    dispatch[EOL][EOS] = compare_mismatch;
+    dispatch[SEOL][EOS] = compare_mismatch;
+    dispatch[BRANCH][EOS] = compare_left_branch;
+    dispatch[NOTHING][EOS] = compare_left_tail;
+    dispatch[TAIL][EOS] = compare_left_tail;
+    dispatch[STAR][EOS] = compare_mismatch;
+    dispatch[PLUS][EOS] = compare_left_plus;
+    dispatch[CURLY][EOS] = compare_left_curly;
+    dispatch[CURLYM][EOS] = compare_left_curly;
+    dispatch[CURLYX][EOS] = compare_left_curly;
+    dispatch[WHILEM][EOS] = compare_left_tail;
+    dispatch[OPEN][EOS] = compare_left_open;
+    dispatch[CLOSE][EOS] = compare_left_tail;
+    dispatch[IFMATCH][EOS] = compare_after_assertion;
+    dispatch[UNLESSM][EOS] = compare_after_assertion;
+    dispatch[MINMOD][EOS] = compare_left_tail;
+    dispatch[OPTIMIZED][EOS] = compare_left_tail;
+
     dispatch[SUCCEED][EOL] = compare_left_tail;
+    dispatch[EOS][EOL] = compare_tails;
     dispatch[EOL][EOL] = compare_tails;
     dispatch[SEOL][EOL] = compare_tails;
     dispatch[BRANCH][EOL] = compare_left_branch;
@@ -2926,6 +3115,7 @@ void rc_init()
     dispatch[OPTIMIZED][EOL] = compare_left_tail;
 
     dispatch[SUCCEED][MEOL] = compare_left_tail;
+    dispatch[EOS][MEOL] = compare_tails;
     dispatch[EOL][MEOL] = compare_tails;
     dispatch[MEOL][MEOL] = compare_tails;
     dispatch[SEOL][MEOL] = compare_tails;
@@ -2957,6 +3147,7 @@ void rc_init()
     dispatch[OPTIMIZED][MEOL] = compare_left_tail;
 
     dispatch[SUCCEED][SEOL] = compare_left_tail;
+    dispatch[EOS][SEOL] = compare_tails;
     dispatch[EOL][SEOL] = compare_tails;
     dispatch[SEOL][SEOL] = compare_tails;
     dispatch[BRANCH][SEOL] = compare_left_branch;
@@ -3450,6 +3641,7 @@ void rc_init()
     }
 
     dispatch[SUCCEED][STAR] = compare_left_tail;
+    dispatch[EOS][STAR] = compare_tails;
     dispatch[EOL][STAR] = compare_tails;
     dispatch[MEOL][STAR] = compare_tails;
     dispatch[SEOL][STAR] = compare_tails;

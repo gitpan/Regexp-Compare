@@ -54,3 +54,7 @@ Revision history for Perl extension Regexp::Compare.
 0.15  Sun Jul  3 07:02:38 UTC 2011
 	- added support for perl 5.14, removed support for perl 5.8
 
+0.16  Tue Jul 12 11:46:55 UTC 2011
+	- distinguishing byte vs. character matches
+	- interpreting \z
+
