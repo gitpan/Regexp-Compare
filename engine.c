@@ -30,6 +30,8 @@
 #define NOT_UPPER_BLOCK (UPPER_BLOCK << MIRROR_SHIFT)
 #define NOT_LOWER_BLOCK (LOWER_BLOCK << MIRROR_SHIFT)
 
+#define EVERY_BLOCK 0x3f3f
+
 #define FORCED_BYTE 0x01
 #define FORCED_CHAR 0x02
 #define FORCED_MISMATCH (FORCED_BYTE | FORCED_CHAR)
@@ -252,10 +254,20 @@ static U16 get_regclass_map(char *desc, int invert)
 	    {
 		if (sign == '+')
 		{
+		    if (mask & (blocks[i] << MIRROR_SHIFT))
+		    {
+		        return invert ? 0 : EVERY_BLOCK;
+		    }
+
 		    mask |= blocks[i];
 		}
 		else if (sign == '!')
 		{
+		    if (mask & blocks[i])
+		    {
+		        return invert ? 0 : EVERY_BLOCK;
+		    }
+
 		    mask |= (blocks[i] << MIRROR_SHIFT);
 		}
 	    }
@@ -518,6 +530,15 @@ static unsigned get_forced_semantics(REGEXP *pt)
     for (i = 0; i < prelen; ++i)
     {
 	c = precomp[i];
+	
+	if (c == '.')
+	{
+	    /* a dot does match Unicode character - the problem is
+	       that character might take up multiple bytes, and we
+	       don't want to match just one of them... */
+	    forced |= FORCED_BYTE;
+	}
+    
 	if (!quoted)
 	{
 	    /* technically, the backslash might be in a comment, but
