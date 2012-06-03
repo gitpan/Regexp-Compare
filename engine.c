@@ -21,6 +21,7 @@
 #define NUMBER_BLOCK 0x0008
 #define UPPER_BLOCK 0x0010
 #define LOWER_BLOCK 0x0020
+#define HEX_DIGIT_BLOCK 0x0040
 
 #define MIRROR_SHIFT 8
 #define NOT_ALNUM_BLOCK (ALNUM_BLOCK << MIRROR_SHIFT)
@@ -29,8 +30,9 @@
 #define NOT_NUMBER_BLOCK (NUMBER_BLOCK << MIRROR_SHIFT)
 #define NOT_UPPER_BLOCK (UPPER_BLOCK << MIRROR_SHIFT)
 #define NOT_LOWER_BLOCK (LOWER_BLOCK << MIRROR_SHIFT)
+#define NOT_HEX_DIGIT_BLOCK (HEX_DIGIT_BLOCK << MIRROR_SHIFT)
 
-#define EVERY_BLOCK 0x3f3f
+#define EVERY_BLOCK 0x7f7f
 
 #define FORCED_BYTE 0x01
 #define FORCED_CHAR 0x02
@@ -106,6 +108,30 @@ static unsigned char alphanumeric_classes[TYPE_COUNT];
 /* true flags for NALNUM and its subsets, 0 otherwise */
 static unsigned char non_alphanumeric_classes[TYPE_COUNT];
 
+/* Simplified hierarchy of character classes; ignoring the difference
+   between classes (i.e. IsAlnum & IsWord), which we probably
+   shouldn't - it is a documented bug, though... */
+static char *regclass_names[] = { "IsAlnum", "IsSpacePerl", "IsWord",
+				  "IsXPosixAlnum", "IsXPosixXDigit",
+				  "IsAlpha", "IsXPosixAlpha",
+				  "IsDigit", "IsLower", "IsUpper",
+				  "IsXDigit", "XPosixDigit", "XPosixWord",
+				  "XPosixAlpha", "XPosixAlnum" };
+static U16 regclass_blocks[] = { ALNUM_BLOCK, SPACE_BLOCK, ALNUM_BLOCK,
+				 ALNUM_BLOCK, HEX_DIGIT_BLOCK, ALPHA_BLOCK,
+				 ALPHA_BLOCK, NUMBER_BLOCK, LOWER_BLOCK,
+				 UPPER_BLOCK, HEX_DIGIT_BLOCK, NUMBER_BLOCK,
+				 ALNUM_BLOCK, ALPHA_BLOCK, ALNUM_BLOCK };
+
+static U16 regclass_superset[] = { NOT_SPACE_BLOCK,
+				   NOT_ALNUM_BLOCK, NOT_ALNUM_BLOCK,
+				   ALNUM_BLOCK, ALNUM_BLOCK,
+				   ALPHA_BLOCK, ALPHA_BLOCK, HEX_DIGIT_BLOCK };
+static U16 regclass_subset[] = { ALNUM_BLOCK,
+				 NOT_ALPHA_BLOCK, NOT_NUMBER_BLOCK,
+				 ALPHA_BLOCK, NUMBER_BLOCK,
+				 UPPER_BLOCK, LOWER_BLOCK, NUMBER_BLOCK };
+
 static unsigned char trivial_nodes[TYPE_COUNT];
 
 static FCompare dispatch[TYPE_COUNT][TYPE_COUNT];
@@ -173,102 +199,90 @@ static void init_unfolded(char *unf, char c)
     unf[1] = ((*unf >= 'a') && (*unf <= 'z')) ? *unf - 'a' + 'A' : *unf;
 }
 
-static char *get_regclass_desc(Arrow *a)
+static U16 extend_mask(U16 mask)
 {
-    regexp_internal *pr;
-    U32 n;
-    struct reg_data *rdata;
+    U16 prev_mask;
+    int i, j;
 
-    assert(a->rn->type == ANYOF);
-#ifndef RC_DEFAULT_UNICODE
-    assert(a->rn->flags & ANYOF_LARGE);
-#else
-    assert(ANYOF_NONBITMAP(a->rn));
-#endif
-
-    /* basically copied from regexec.c:regclass_swash */
-    n = ARG_LOC(a->rn);
-    pr = RXi_GET(a->origin);
-    if (!pr) /* this should have been tested by find_internal during
-		initialization, but just in case... */
+    /* extra cycle is inefficient but makes superset & subset
+       definitions order-independent */
+    prev_mask = 0;
+    while (mask != prev_mask)
     {
-	return 0;
+        prev_mask = mask;
+	for (i = 0; i < 2; ++i)
+	{
+	    for (j = 0; j < SIZEOF_ARRAY(regclass_superset); ++j)
+	    {
+		U16 b = regclass_superset[j];
+		U16 s = regclass_subset[j];
+		if (i)
+		{
+		    U16 t;
+
+		    t = MIRROR_BLOCK(b);
+		    b = MIRROR_BLOCK(s);
+		    s = t;
+		}
+
+		if (mask & b)
+		{
+		    mask |= s;
+		}
+	    }
+	}
     }
 
-    rdata = pr->data;
-
-    if ((n < rdata->count) &&
-	(rdata->what[n] == 's')) {
-        SV *rv = (SV *)(rdata->data[n]);
-	AV *av = (AV *)SvRV(rv);
-	SV **ary = AvARRAY(av);
-
-	/* From regcomp.c:regclass: the 0th element stores the
-	   character class description in its textual form. It isn't
-	   very clear what exactly the textual form is, but we hope
-	   it's 0-terminated. */
-	return SvPV_nolen(*ary);
-    }
-      
-    return 0;
+    return mask;
 }
 
-static U16 get_regclass_map(char *desc, int invert)
+static int convert_desc_to_map(char *desc, int invert, U16 *map)
 {
-    /* ignoring the difference between classes (i.e. IsAlnum &
-       IsWord), which we probably shouldn't... */
-    static char *names[] = { "IsSpacePerl", "IsAlnum", "IsWord",
-			     "IsXPosixAlnum", "IsAlpha", "IsXPosixAlpha",
-			     "IsDigit", "IsLower", "IsUpper" };
-    static U16 blocks[] = { SPACE_BLOCK, ALNUM_BLOCK, ALNUM_BLOCK,
-			    ALNUM_BLOCK, ALPHA_BLOCK, ALPHA_BLOCK,
-			    NUMBER_BLOCK, LOWER_BLOCK, UPPER_BLOCK };
-
-    static U16 superset[] = { NOT_SPACE_BLOCK,
-			      NOT_ALNUM_BLOCK, NOT_ALNUM_BLOCK,
-			      ALNUM_BLOCK, ALNUM_BLOCK,
-			      ALPHA_BLOCK, ALPHA_BLOCK };
-    static U16 subset[] = { ALNUM_BLOCK,
-			    NOT_ALPHA_BLOCK, NOT_NUMBER_BLOCK,
-			    ALPHA_BLOCK, NUMBER_BLOCK,
-			    UPPER_BLOCK, LOWER_BLOCK };
-
-    int i, j;
+    int i;
     U16 mask = 0;
-    U16 prev_mask;
+    char *p;
 
-    char *p = strstr(desc, "utf8::");
+    /* fprintf(stderr, "enter convert_desc_to_map(%s, %d\n", desc, invert); */
 
+    p = strstr(desc, "utf8::");
     /* make sure *(p - 1) is valid */
     if (p == desc)
     {
-	p = strstr(p + 6, "utf8::");
+        rc_error = "no inversion flag before character class description";
+	return -1;
     }
 
     while (p)
     {
         char sign = *(p - 1);
-	for (i = 0; i < SIZEOF_ARRAY(names); ++i)
+	for (i = 0; i < SIZEOF_ARRAY(regclass_names); ++i)
 	{
-	    if (!strncmp(p + 6, names[i], strlen(names[i])))
+	    if (!strncmp(p + 6, regclass_names[i], strlen(regclass_names[i])))
 	    {
 		if (sign == '+')
 		{
-		    if (mask & (blocks[i] << MIRROR_SHIFT))
+		    if (mask & (regclass_blocks[i] << MIRROR_SHIFT))
 		    {
-		        return invert ? 0 : EVERY_BLOCK;
+		        *map = invert ? 0 : EVERY_BLOCK;
+			return 1;
 		    }
 
-		    mask |= blocks[i];
+		    mask |= regclass_blocks[i];
 		}
 		else if (sign == '!')
 		{
-		    if (mask & blocks[i])
+		    if (mask & regclass_blocks[i])
 		    {
-		        return invert ? 0 : EVERY_BLOCK;
+		        *map = invert ? 0 : EVERY_BLOCK;
+			return 1;
 		    }
 
-		    mask |= (blocks[i] << MIRROR_SHIFT);
+		    mask |= (regclass_blocks[i] << MIRROR_SHIFT);
+		}
+		else
+		{
+		    rc_error = "unknown inversion flag before character class description";
+		    return -1;
 		}
 	    }
 	}
@@ -291,44 +305,219 @@ static U16 get_regclass_map(char *desc, int invert)
 	mask |= ALNUM_BLOCK;
     }
 
-    /* extra cycle is inefficient but makes superset & subset
-       definitions order-independent */
-    prev_mask = 0;
-    while (mask != prev_mask)
-    {
-        prev_mask = mask;
-	for (i = 0; i < 2; ++i)
-	{
-	    for (j = 0; j < SIZEOF_ARRAY(superset); ++j)
-	    {
-		U16 b = superset[j];
-		U16 s = subset[j];
-		if (i)
-		{
-		    U16 t;
-
-		    t = MIRROR_BLOCK(b);
-		    b = MIRROR_BLOCK(s);
-		    s = t;
-		}
-
-		if (mask & b)
-		{
-		    mask |= s;
-		}
-	    }
-	}
-    }
-
-    return mask;
+    *map = extend_mask(mask);
+    return 1;
 }
 
-static U16 get_map(Arrow *a)
+#ifdef RC_INVLIST
+/* invlist methods are static inside regcomp.c, so we must copy them... */
+static UV *get_invlist_len_addr(SV *invlist)
 {
-    U16 map = 0;
+    return (UV *)SvPVX(invlist);
+}
 
-    /* fprintf(stderr, "enter get_map\n"); */
+static UV *get_invlist_zero_addr(SV *invlist)
+{
+    return (UV *)(SvPVX(invlist) + (3 * sizeof(UV)));
+}
+
+static UV *invlist_array(SV *invlist)
+{
+    return (UV *) (get_invlist_zero_addr(invlist) +
+	*get_invlist_zero_addr(invlist));
+}
+
+/* #define DEBUG_dump_invlist */
+
+static int convert_invlist_to_map(SV *invlist, int invert, U16 *map)
+{
+    /* 
+       Not quite what's in charclass_invlists.h - we skip the header
+       as well as all ASCII values.
+       Note that changes to the arrays may require changing the switch
+       below.
+    */
+    static UV perl_space_invlist[] = { 128, 133, 134, 160, 161, 5760,
+        5761, 6158, 6159, 8192, 8203, 8232, 8234, 8239, 8240, 8287,
+        8288, 12288, 12289 };
+
+    static UV xposix_xdigit_invlist[] = { 128, 65296, 65306, 65313,
+        65319, 65345, 65351 };
+
+#ifdef DEBUG_dump_invlist
+    U16 i;
+    char div[3];
+#endif
+
+    UV *ila;
+    UV ill;
+    U16 mask = 0;
+
+#ifdef DEBUG_dump_invlist
+    fprintf(stderr, "enter convert_invlist_to_map(..., %d, ...)\n", invert);
+#endif
+
+    ila = invlist_array(invlist);
+    ill = *get_invlist_len_addr(invlist);
+
+    switch (ill)
+    {
+    case SIZEOF_ARRAY(perl_space_invlist):
+        if (!memcmp(ila, perl_space_invlist, sizeof(perl_space_invlist)))
+	{
+#ifdef DEBUG_dump_invlist
+	    fprintf(stderr, "NOT_SPACE_BLOCK\n");
+#endif
+	    mask = NOT_SPACE_BLOCK;
+	}
+
+        break;
+
+    case SIZEOF_ARRAY(perl_space_invlist) - 1:
+        if (!memcmp(ila, perl_space_invlist + 1,
+            sizeof(perl_space_invlist) - sizeof(perl_space_invlist[0])))
+	{
+#ifdef DEBUG_dump_invlist
+	    fprintf(stderr, "SPACE_BLOCK\n");
+#endif
+	    mask = SPACE_BLOCK;
+	}
+
+        break;
+
+    case SIZEOF_ARRAY(xposix_xdigit_invlist):
+        if (!memcmp(ila, xposix_xdigit_invlist, sizeof(xposix_xdigit_invlist)))
+	{
+#ifdef DEBUG_dump_invlist
+	    fprintf(stderr, "NOT_NUMBER_BLOCK\n");
+#endif
+	    mask = NOT_NUMBER_BLOCK;
+	}
+
+        break;
+
+    case SIZEOF_ARRAY(xposix_xdigit_invlist) - 1:
+        if (!memcmp(ila, xposix_xdigit_invlist + 1,
+            sizeof(xposix_xdigit_invlist) - sizeof(xposix_xdigit_invlist[0])))
+	{
+#ifdef DEBUG_dump_invlist
+	    fprintf(stderr, "NUMBER_BLOCK\n");
+#endif
+	    mask = NUMBER_BLOCK;
+	}
+
+        break;
+    }
+
+    if (mask)
+    {
+        if (invert)
+	{
+	    mask = MIRROR_BLOCK(mask);
+	}
+
+	*map = extend_mask(mask);
+	return 1;
+    }
+
+#ifdef DEBUG_dump_invlist
+    div[0] = '{';
+    div[1] = ' ';
+    div[2] = 0;
+    for (i = 0; i < ill; ++i)
+    {
+        fprintf(stderr, "%s%d", div, (int)(ila[i]));
+	div[0] = ',';
+    }
+
+    fprintf(stderr, " }\n");
+#endif
+
+    return 0;
+}
+#endif
+
+static int convert_regclass_map(Arrow *a, U16 *map)
+{
+    regexp_internal *pr;
+    U32 n;
+    struct reg_data *rdata;
+
+    /* fprintf(stderr, "enter convert_regclass_map\n"); */
+
     assert(a->rn->type == ANYOF);
+#ifndef RC_DEFAULT_UNICODE
+    assert(a->rn->flags & ANYOF_LARGE);
+#else
+    assert(ANYOF_NONBITMAP(a->rn));
+#endif
+
+    /* basically copied from regexec.c:regclass_swash */
+    n = ARG_LOC(a->rn);
+    pr = RXi_GET(a->origin);
+    if (!pr) /* this should have been tested by find_internal during
+		initialization, but just in case... */
+    {
+        rc_error = "regexp_internal not found";
+	return -1;
+    }
+
+    rdata = pr->data;
+
+    if ((n < rdata->count) &&
+	(rdata->what[n] == 's')) {
+        SV *rv = (SV *)(rdata->data[n]);
+	AV *av = (AV *)SvRV(rv);
+	SV **ary = AvARRAY(av);
+	SV *si = *ary;
+
+	if (si && (si != &PL_sv_undef))
+        {
+	    /* From regcomp.c:regclass: the 0th element stores the
+	       character class description in its textual form. It isn't
+	       very clear what exactly the textual form is, but we hope
+	       it's 0-terminated. */
+	  return convert_desc_to_map(SvPV_nolen(*ary),
+	      !!(a->rn->flags & ANYOF_INVERT),
+	      map);
+	}
+#ifdef RC_INVLIST
+	else
+	{
+	    /* in perl 5.16, the textual form doesn't necessarily exist... */
+	    if (av_len(av) >= 3)
+	    {
+	        SV *invlist = ary[3];
+
+		if (SvUV(ary[4])) /* invlist_has_user_defined_property */
+		{
+		    /* fprintf(stderr, "invlist has user defined property\n"); */
+		    return 0;
+		}
+
+		return convert_invlist_to_map(invlist,
+		    !!(a->rn->flags & ANYOF_INVERT),
+                    map);
+	    }
+
+	    /* fprintf(stderr, "regclass invlist not found\n"); */
+	    return 0;
+	}
+#endif
+    }
+
+    rc_error = "regclass not found";
+    return -1;
+}
+
+/* returns 1 OK (map set), 0 map not recognized/representable, -1
+   unexpected input (rc_error set) */
+static int convert_map(Arrow *a, U16 *map)
+{
+    /* fprintf(stderr, "enter convert_map\n"); */
+
+    assert(a->rn->type == ANYOF);
+    assert(map);
 
 #ifndef RC_DEFAULT_UNICODE
     if (a->rn->flags & ANYOF_LARGE)
@@ -336,17 +525,14 @@ static U16 get_map(Arrow *a)
     if (ANYOF_NONBITMAP(a->rn))
 #endif
     {
-	char *desc = get_regclass_desc(a);
-	if (desc)
-	{
-	    /* fprintf(stderr, "desc = %s\n", desc); */
-	    map = get_regclass_map(desc,
-		!!(a->rn->flags & ANYOF_INVERT));
-	    /* fprintf(stderr, "map = 0x%x\n", map); */
-	}
+        return convert_regclass_map(a, map);
     }
-
-    return map;
+    else
+    {
+        /* fprintf(stderr, "zero map\n"); */
+	*map = 0;
+	return 1;
+    }
 }
 
 static int get_assertion_offset(regnode *p)
@@ -736,9 +922,9 @@ static int get_jump_offset(regnode *p)
     return q - p;
 }
 
-RCRegexp *rc_regcomp(SV *rs)
+REGEXP *rc_regcomp(SV *rs)
 {
-    RCRegexp *rx;
+    REGEXP *rx;
 
     if (!rs)
     {
@@ -754,7 +940,7 @@ RCRegexp *rc_regcomp(SV *rs)
     return rx;
 }
 
-void rc_regfree(RCRegexp *rx)
+void rc_regfree(REGEXP *rx)
 {
     if (rx)
     {
@@ -1112,7 +1298,16 @@ static int compare_anyof_anyof(int anchored, Arrow *a1, Arrow *a2)
     if ((extra_left || (a1->rn->flags & ANYOF_UNICODE_ALL)) &&
 	!(a2->rn->flags & ANYOF_UNICODE_ALL))
     {
-	if (get_map(a1) & ~get_map(a2))
+        U16 m1, m2;
+	int cr1, cr2;
+	cr1 = convert_map(a1, &m1);
+	cr2 = convert_map(a2, &m2);
+	if ((cr1 == -1) || (cr2 == -1))
+	{
+	    return -1;
+	}
+
+	if (!cr1 || !cr2 || (m1 & ~m2))
 	{
 	    return compare_mismatch(anchored, a1, a2);
 	}
@@ -1151,7 +1346,14 @@ static int compare_alnum_anyof(int anchored, Arrow *a1, Arrow *a2)
 
     if (!(a2->rn->flags & ANYOF_UNICODE_ALL))
     {
-	if (!(get_map(a2) & ALNUM_BLOCK))
+        U16 map;
+	int cr = convert_map(a2, &map);
+	if (cr == -1)
+	{
+	    return -1;
+	}
+
+	if (!cr || !(map & ALNUM_BLOCK))
 	{
 	    return compare_mismatch(anchored, a1, a2);
 	}
@@ -1167,7 +1369,14 @@ static int compare_nalnum_anyof(int anchored, Arrow *a1, Arrow *a2)
 
     if (!(a2->rn->flags & ANYOF_UNICODE_ALL))
     {
-	if (!(get_map(a2) & NOT_ALNUM_BLOCK))
+        U16 map;
+	int cr = convert_map(a2, &map);
+	if (cr == -1)
+	{
+	    return -1;
+	}
+
+	if (!cr || !(map & NOT_ALNUM_BLOCK))
 	{
 	    return compare_mismatch(anchored, a1, a2);
 	}
@@ -1211,7 +1420,14 @@ static int compare_digit_anyof(int anchored, Arrow *a1, Arrow *a2)
 
     if (!(a2->rn->flags & ANYOF_UNICODE_ALL))
     {
-	if (!(get_map(a2) & NUMBER_BLOCK))
+        U16 map;
+	int cr = convert_map(a2, &map);
+	if (cr == -1)
+	{
+	    return -1;
+	}
+
+	if (!cr || !(map & NUMBER_BLOCK))
 	{
 	    return compare_mismatch(anchored, a1, a2);
 	}
@@ -1227,7 +1443,14 @@ static int compare_ndigit_anyof(int anchored, Arrow *a1, Arrow *a2)
 
     if (!(a2->rn->flags & ANYOF_UNICODE_ALL))
     {
-	if (!(get_map(a2) & NOT_NUMBER_BLOCK))
+        U16 map;
+	int cr = convert_map(a2, &map);
+	if (cr == -1)
+	{
+	    return -1;
+	}
+
+	if (!cr || !(map & NOT_NUMBER_BLOCK))
 	{
 	    return compare_mismatch(anchored, a1, a2);
 	}
@@ -2866,7 +3089,7 @@ static int success(int anchored, Arrow *a1, Arrow *a2)
 
 /* #define DEBUG_dump */
 
-int rc_compare(RCRegexp *pt1, RCRegexp *pt2)
+int rc_compare(REGEXP *pt1, REGEXP *pt2)
 {
     Arrow a1, a2;
     regnode *p1, *p2;
@@ -2875,13 +3098,8 @@ int rc_compare(RCRegexp *pt1, RCRegexp *pt2)
     int i;    
 #endif
 
-#ifdef RC_FIST_CLASS_REGEXP
     a1.origin = SvANY(pt1);
     a2.origin = SvANY(pt2);
-#else
-    a1.origin = pt1;
-    a2.origin = pt2;
-#endif
 
     if ((get_forced_semantics(pt1) | get_forced_semantics(pt2)) == FORCED_MISMATCH)
     {

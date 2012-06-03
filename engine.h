@@ -8,18 +8,16 @@
 #if PERL_API_REVISION != 5
 #error This module is only for Perl 5
 #else
-#if PERL_API_VERSION == 10
-typedef regexp RCRegexp;
-#else
 #if PERL_API_VERSION == 12
-#define RC_FIST_CLASS_REGEXP
-typedef REGEXP RCRegexp;
 #else
 #if PERL_API_VERSION == 14
-#define RC_FIST_CLASS_REGEXP
 #define RC_DEFAULT_UNICODE
 #define ANYOF_UNICODE 0
-typedef REGEXP RCRegexp;
+#else
+#if PERL_API_VERSION == 16
+#define RC_DEFAULT_UNICODE
+#define RC_INVLIST
+#define ANYOF_UNICODE 0
 #else
 #error Unsupported PERL_API_VERSION
 #endif
@@ -37,10 +35,10 @@ extern char *rc_error;
 void rc_init();
 
 /* might croak but never returns null */
-RCRegexp *rc_regcomp(SV *rs);
+REGEXP *rc_regcomp(SV *rs);
 
-void rc_regfree(RCRegexp *rx);
+void rc_regfree(REGEXP *rx);
 
-int rc_compare(RCRegexp *pt1, RCRegexp *pt2);
+int rc_compare(REGEXP *pt1, REGEXP *pt2);
 
 #endif

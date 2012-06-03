@@ -62,3 +62,8 @@ Revision history for Perl extension Regexp::Compare.
 	- not matching Unicode characters against .
 	- improved comparison of character classes
 
+0.18  Sun Jun  3 12:22:56 UTC 2012
+	- added support for perl 5.16, removed support for perl 5.10
+	- better matching of hexadecimal digits
+	- worse matching of upper- and lowercase letters
+

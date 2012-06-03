@@ -19,7 +19,7 @@ _is_less_or_equal(rs1, rs2)
         SV *rs2;
         CODE:
         {
-	RCRegexp *r1 = 0, *r2 = 0;
+	REGEXP *r1 = 0, *r2 = 0;
 	int rv;
 
 	ENTER;
