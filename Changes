@@ -67,3 +67,6 @@ Revision history for Perl extension Regexp::Compare.
 	- better matching of hexadecimal digits
 	- worse matching of upper- and lowercase letters
 
+0.19  Wed Jun  6 16:02:42 UTC 2012
+	- requiring perl 5.12 in Makefile.PL
+	- added support for \N

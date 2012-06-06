@@ -754,12 +754,16 @@ static unsigned get_forced_semantics(REGEXP *pt)
 
 		    i += 8;
 		}
-		else
+		else if ((i + 1 < prelen) &&
+		    (precomp[i + 1] == '{'))
 		{
 		    forced |= FORCED_CHAR;
 		}
 
-	        matched = 1;
+		/* otherwise it's not an escape, but the inverse of \n
+		   - we aren't interested in that */
+
+		matched = 1;
 	    }
 	    else if (c == 'x')
 	    {
