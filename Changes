@@ -70,3 +70,6 @@ Revision history for Perl extension Regexp::Compare.
 0.19  Wed Jun  6 16:02:42 UTC 2012
 	- requiring perl 5.12 in Makefile.PL
 	- added support for \N
+
+0.20  Fri Nov 16 16:43:40 UTC 2012
+	- recognizing more names of character classes
