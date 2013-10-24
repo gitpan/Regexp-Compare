@@ -73,3 +73,8 @@ Revision history for Perl extension Regexp::Compare.
 
 0.20  Fri Nov 16 16:43:40 UTC 2012
 	- recognizing more names of character classes
+
+0.21  Thu Oct 24 14:11:52 UTC 2013
+	- requiring at least perl 5.14, supporting perl 5.18.x
+	- partial support for /a modifier
+

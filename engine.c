@@ -5,6 +5,24 @@
 #include <string.h>
 #include <assert.h>
 
+#if PERL_API_REVISION != 5
+#error This module is only for Perl 5
+#else
+#if PERL_API_VERSION == 14
+#else
+#if PERL_API_VERSION == 16
+#define RC_INVLIST
+#else
+#if PERL_API_VERSION == 18
+#define RC_INVLIST
+#define RC_POSIX_NODES
+#else
+#error Unsupported PERL_API_VERSION
+#endif
+#endif
+#endif
+#endif
+
 #define SIZEOF_ARRAY(a) (sizeof(a) / sizeof(a[0]))
 
 #define TOLOWER(c) ((((c) >= 'A') && ((c) <= 'Z')) ? ((c) - 'A' + 'a') : (c))
@@ -12,8 +30,6 @@
 #define LETTER_COUNT ('z' - 'a' + 1)
 
 #define INFINITE_COUNT 32767
-
-#define TYPE_COUNT (OPTIMIZED + 1)
 
 #define ALNUM_BLOCK 0x0001
 #define SPACE_BLOCK 0x0002
@@ -23,6 +39,7 @@
 #define LOWER_BLOCK 0x0020
 #define HEX_DIGIT_BLOCK 0x0040
 #define HORIZONTAL_SPACE_BLOCK 0x0080
+#define VERTICAL_SPACE_BLOCK 0x0100
 
 #define MIRROR_SHIFT 16
 #define NOT_ALNUM_BLOCK (ALNUM_BLOCK << MIRROR_SHIFT)
@@ -33,8 +50,9 @@
 #define NOT_LOWER_BLOCK (LOWER_BLOCK << MIRROR_SHIFT)
 #define NOT_HEX_DIGIT_BLOCK (HEX_DIGIT_BLOCK << MIRROR_SHIFT)
 #define NOT_HORIZONTAL_SPACE_BLOCK (HORIZONTAL_SPACE_BLOCK << MIRROR_SHIFT)
+#define NOT_VERTICAL_SPACE_BLOCK (VERTICAL_SPACE_BLOCK << MIRROR_SHIFT)
 
-#define EVERY_BLOCK 0x007f007f
+#define EVERY_BLOCK 0x01ff01ff
 
 #define FORCED_BYTE 0x01
 #define FORCED_CHAR 0x02
@@ -96,9 +114,17 @@ static char horizontal_whitespace_expl[] = { '\t', ' ' };
 
 static ByteClass horizontal_whitespace;
 
+static char vertical_whitespace_expl[] = { '\r', '\v', '\f', '\n' };
+
+static ByteClass vertical_whitespace;
+
 static char digit_expl[10];
 
 static ByteClass digit;
+
+static char xdigit_expl[10 + 2 * 6];
+
+static ByteClass xdigit;
 
 static char ndot_expl[] = { '\n' };
 
@@ -106,50 +132,121 @@ static ByteClass ndot;
 
 static char alphanumeric_expl[11 + 2 * LETTER_COUNT];
 
-static ByteClass alphanumeric;
+static ByteClass word_bc;
+
+static ByteClass alnum_bc;
 
 /* true flags for ALNUM and its subsets, 0 otherwise */
-static unsigned char alphanumeric_classes[TYPE_COUNT];
+static unsigned char alphanumeric_classes[REGNODE_MAX];
 
 /* true flags for NALNUM and its subsets, 0 otherwise */
-static unsigned char non_alphanumeric_classes[TYPE_COUNT];
+static unsigned char non_alphanumeric_classes[REGNODE_MAX];
+
+#ifdef RC_POSIX_NODES
+static unsigned char word_posix_regclasses[_CC_VERTSPACE + 1];
+
+static unsigned char non_word_posix_regclasses[_CC_VERTSPACE + 1];
+
+static unsigned char newline_posix_regclasses[_CC_VERTSPACE + 1];
+#endif
 
 /* Simplified hierarchy of character classes; ignoring the difference
    between classes (i.e. IsAlnum & IsWord), which we probably
    shouldn't - it is a documented bug, though... */
 static char *regclass_names[] = { "Digit", "IsAlnum", "IsSpacePerl",
-				  "IsHorizSpace",
+				  "IsHorizSpace", "IsVertSpace",
 				  "IsWord", "IsXPosixAlnum", "IsXPosixXDigit",
 				  "IsAlpha", "IsXPosixAlpha",
 				  "IsDigit", "IsLower", "IsUpper",
-				  "IsXDigit", "SpacePerl", "Word",
-				  "XPosixDigit",
+				  "IsXDigit", "SpacePerl", "VertSpace",
+				  "Word", "XPosixDigit",
 				  "XPosixWord", "XPosixAlpha", "XPosixAlnum",
 				  "XPosixXDigit" };
 
 static U32 regclass_blocks[] = { NUMBER_BLOCK, ALNUM_BLOCK, SPACE_BLOCK, 
-				 HORIZONTAL_SPACE_BLOCK, ALNUM_BLOCK,
+				 HORIZONTAL_SPACE_BLOCK, 
+				 VERTICAL_SPACE_BLOCK, ALNUM_BLOCK,
 				 ALNUM_BLOCK, HEX_DIGIT_BLOCK, ALPHA_BLOCK,
 				 ALPHA_BLOCK, NUMBER_BLOCK, LOWER_BLOCK,
 				 UPPER_BLOCK, HEX_DIGIT_BLOCK, SPACE_BLOCK,
-				 ALNUM_BLOCK, NUMBER_BLOCK,
-				 ALNUM_BLOCK, ALPHA_BLOCK, ALNUM_BLOCK,
-				 HEX_DIGIT_BLOCK};
+				 VERTICAL_SPACE_BLOCK, ALNUM_BLOCK,
+				 NUMBER_BLOCK, ALNUM_BLOCK, ALPHA_BLOCK,
+				 ALNUM_BLOCK, HEX_DIGIT_BLOCK};
 
 static U32 regclass_superset[] = { NOT_SPACE_BLOCK,
-				   NOT_ALNUM_BLOCK, NOT_ALNUM_BLOCK,
+				   NOT_ALPHA_BLOCK, NOT_NUMBER_BLOCK,
 				   ALNUM_BLOCK, ALNUM_BLOCK,
 				   ALPHA_BLOCK, ALPHA_BLOCK, HEX_DIGIT_BLOCK,
-				   SPACE_BLOCK };
+				   SPACE_BLOCK, NOT_NUMBER_BLOCK,
+				   NOT_HEX_DIGIT_BLOCK };
 static U32 regclass_subset[] = { ALNUM_BLOCK,
-				 NOT_ALPHA_BLOCK, NOT_NUMBER_BLOCK,
+				 NOT_ALNUM_BLOCK, NOT_ALNUM_BLOCK,
 				 ALPHA_BLOCK, NUMBER_BLOCK,
 				 UPPER_BLOCK, LOWER_BLOCK, NUMBER_BLOCK,
-				 HORIZONTAL_SPACE_BLOCK };
+				 HORIZONTAL_SPACE_BLOCK, 
+				 VERTICAL_SPACE_BLOCK, VERTICAL_SPACE_BLOCK };
 
-static unsigned char trivial_nodes[TYPE_COUNT];
+#ifdef RC_POSIX_NODES
+static U32 posix_regclass_blocks[] = { ALNUM_BLOCK /* _CC_WORDCHAR == 0 */,
+				       NUMBER_BLOCK /* _CC_DIGIT == 1 */,
+				       ALPHA_BLOCK /* _CC_ALPHA == 2 */,
+				       LOWER_BLOCK /* _CC_LOWER == 3 */,
+				       UPPER_BLOCK /* _CC_UPPER == 4 */,
+				       0,
+				       0,
+				       ALNUM_BLOCK /* _CC_ALPHANUMERIC == 7 */,
+				       0,
+				       0,
+				       SPACE_BLOCK /* _CC_SPACE == 10 */,
+				       HORIZONTAL_SPACE_BLOCK /* _CC_BLANK == 11, and according to perlrecharclass "\p{Blank}" and "\p{HorizSpace}" are synonyms. */,
+				       HEX_DIGIT_BLOCK /* _CC_XDIGIT == 12 */,
+				       0,
+				       0,
+				       0,
+				       VERTICAL_SPACE_BLOCK /* _CC_VERTSPACE == 16 */ };
 
-static FCompare dispatch[TYPE_COUNT][TYPE_COUNT];
+static unsigned char *posix_regclass_bitmaps[] = { word_bc.bitmap,
+						   digit.bitmap,
+						   0,
+						   0,
+						   0,
+						   0,
+						   0,
+						   alnum_bc.bitmap,
+						   0,
+						   0,
+						   whitespace.bitmap,
+						   horizontal_whitespace.bitmap,
+						   xdigit.bitmap,
+						   0,
+						   0,
+						   0,
+						   vertical_whitespace.bitmap
+};
+
+static unsigned char *posix_regclass_nbitmaps[] = { word_bc.nbitmap,
+						    digit.nbitmap,
+						    0,
+						    0,
+						    0,
+						    0,
+						    0,
+						    alnum_bc.nbitmap,
+						    0,
+						    0,
+						    whitespace.nbitmap,
+						    horizontal_whitespace.nbitmap,
+						    xdigit.nbitmap,
+						    0,
+						    0,
+						    0,
+						    vertical_whitespace.nbitmap
+};
+#endif
+
+static unsigned char trivial_nodes[REGNODE_MAX];
+
+static FCompare dispatch[REGNODE_MAX][REGNODE_MAX];
 
 static int compare(int anchored, Arrow *a1, Arrow *a2);
 static int compare_right_branch(int anchored, Arrow *a1, Arrow *a2);
@@ -305,6 +402,8 @@ static int convert_desc_to_map(char *desc, int invert, U32 *map)
 	p = strstr(p + 6, "utf8::");
     }
 
+    /* fprintf(stderr, "parsed 0x%x\n", (unsigned)mask); */
+
     if ((mask & ALPHA_BLOCK) && (mask & NUMBER_BLOCK))
     {
 	mask |= ALNUM_BLOCK;
@@ -358,6 +457,8 @@ static int convert_invlist_to_map(SV *invlist, int invert, U32 *map)
 
     static UV horizontal_space_invlist[] = { 128, 160, 161, 5760, 5761,
         6158, 6159, 8192, 8203, 8239, 8240, 8287, 8288, 12288, 12289 };
+
+    static UV vertical_space_invlist[] = { 128, 133, 134, 8232, 8234 };
 
     static UV xposix_xdigit_invlist[] = { 128, 65296, 65306, 65313,
         65319, 65345, 65351 };
@@ -426,6 +527,29 @@ static int convert_invlist_to_map(SV *invlist, int invert, U32 *map)
 
         break;
 
+    case SIZEOF_ARRAY(vertical_space_invlist):
+        if (!memcmp(ila, vertical_space_invlist, sizeof(vertical_space_invlist)))
+	{
+#ifdef DEBUG_dump_invlist
+	    fprintf(stderr, "NOT_VERTICAL_SPACE_BLOCK\n");
+#endif
+	    mask = NOT_VERTICAL_SPACE_BLOCK;
+	}
+
+        break;
+
+    case SIZEOF_ARRAY(vertical_space_invlist) - 1:
+        if (!memcmp(ila, vertical_space_invlist + 1,
+            sizeof(vertical_space_invlist) - sizeof(vertical_space_invlist[0])))
+	{
+#ifdef DEBUG_dump_invlist
+	    fprintf(stderr, "VERTICAL_SPACE_BLOCK\n");
+#endif
+	    mask = VERTICAL_SPACE_BLOCK;
+	}
+
+        break;
+
     case SIZEOF_ARRAY(xposix_xdigit_invlist):
         if (!memcmp(ila, xposix_xdigit_invlist, sizeof(xposix_xdigit_invlist)))
 	{
@@ -487,11 +611,7 @@ static int convert_regclass_map(Arrow *a, U32 *map)
     /* fprintf(stderr, "enter convert_regclass_map\n"); */
 
     assert(a->rn->type == ANYOF);
-#ifndef RC_DEFAULT_UNICODE
-    assert(a->rn->flags & ANYOF_LARGE);
-#else
     assert(ANYOF_NONBITMAP(a->rn));
-#endif
 
     /* basically copied from regexec.c:regclass_swash */
     n = ARG_LOC(a->rn);
@@ -522,7 +642,8 @@ static int convert_regclass_map(Arrow *a, U32 *map)
 	      !!(a->rn->flags & ANYOF_INVERT),
 	      map);
 	}
-#ifdef RC_INVLIST
+/* FIXME: in perl 5.18, crashes for inverted classes */
+#if defined(RC_INVLIST)
 	else
 	{
 	    /* in perl 5.16, the textual form doesn't necessarily exist... */
@@ -560,11 +681,7 @@ static int convert_map(Arrow *a, U32 *map)
     assert(a->rn->type == ANYOF);
     assert(map);
 
-#ifndef RC_DEFAULT_UNICODE
-    if (a->rn->flags & ANYOF_LARGE)
-#else
     if (ANYOF_NONBITMAP(a->rn))
-#endif
     {
         return convert_regclass_map(a, map);
     }
@@ -575,6 +692,57 @@ static int convert_map(Arrow *a, U32 *map)
 	return 1;
     }
 }
+
+#ifdef RC_POSIX_NODES
+/* returns 1 OK (map set), 0 map not recognized/representable */
+static int convert_class_narrow(Arrow *a, U32 *map)
+{
+    /* fprintf(stderr, "enter convert_class_narrow\n"); */
+
+    assert(map);
+
+    if (a->rn->flags >= SIZEOF_ARRAY(posix_regclass_blocks))
+    {
+        /* fprintf(stderr, "unknown class %d\n", a->rn->flags); */
+        return 0;
+    }
+
+    U32 mask = posix_regclass_blocks[a->rn->flags];
+    if (!mask)
+    {
+        /* fprintf(stderr, "class %d ignored\n", a->rn->flags); */
+	return 0;
+    }
+
+    *map = mask;
+    return 1;
+}
+
+/* returns 1 OK (map set), 0 map not recognized/representable */
+static int convert_class(Arrow *a, U32 *map)
+{
+    if (!convert_class_narrow(a, map))
+    {
+        return 0;
+    }
+
+    *map = extend_mask(*map);
+    return 1;
+}
+
+static int convert_negative_class(Arrow *a, U32 *map)
+{
+    U32 mask;
+
+    if (!convert_class_narrow(a, &mask))
+    {
+        return 0;
+    }
+
+    *map = extend_mask(MIRROR_BLOCK(mask));
+    return 1;
+}
+#endif
 
 static int get_assertion_offset(regnode *p)
 {
@@ -601,9 +769,21 @@ static int get_synth_offset(regnode *p)
     }
     else if (trivial_nodes[p->type] ||
 	     (p->type == REG_ANY) || (p->type == SANY) ||
-	     (p->type == ALNUM) || (p->type == NALNUM) ||
-	     (p->type == SPACE) || (p->type == NSPACE) ||
-	     (p->type == DIGIT) || (p->type == NDIGIT))
+#ifndef RC_POSIX_NODES
+	     (p->type == ALNUM) || (p->type == ALNUMA) ||
+	     (p->type == NALNUM) || (p->type == NALNUMA) ||
+	     (p->type == SPACE) || (p->type == SPACEA) ||
+	     (p->type == NSPACE) || (p->type == NSPACEA) ||
+	     (p->type == DIGIT) || (p->type == DIGITA) ||
+	     (p->type == NDIGIT) || (p->type == NDIGITA) ||
+	     (p->type == VERTWS) || (p->type == NVERTWS) ||
+	     (p->type == HORIZWS) || (p->type == NHORIZWS)
+#else
+	     (p->type == POSIXD) || (p->type == NPOSIXD) ||
+	     (p->type == POSIXU) || (p->type == NPOSIXU) ||
+	     (p->type == POSIXA) || (p->type == NPOSIXA)
+#endif
+	     )
     {
 	return 1;  
     }
@@ -612,7 +792,7 @@ static int get_synth_offset(regnode *p)
         /* other flags obviously exist, but they haven't been seen yet
 	   and it isn't clear what they mean */
         unsigned int unknown = p->flags & ~(ANYOF_INVERT |
-	    ANYOF_LARGE | ANYOF_UNICODE | ANYOF_UNICODE_ALL);
+	    ANYOF_LARGE | ANYOF_UNICODE_ALL);
         if (unknown)
 	{
 	    /* p[10] seems always 0 on Linux, but 0xfbfaf9f8 seen on
@@ -873,7 +1053,7 @@ static regnode *alloc_terminated(regnode *p, int sz)
 
     last = alt[sz - 1].type;
     /* fprintf(stderr, "type: %d\n", last); */
-    if ((last >= TYPE_COUNT) || !trivial_nodes[last])
+    if ((last >= REGNODE_MAX) || !trivial_nodes[last])
     {
 	rc_error = "Alternative doesn't end like subexpression";
 	return 0;
@@ -1260,15 +1440,11 @@ static int compare_bitmaps(int anchored, Arrow *a1, Arrow *a2,
     /* fprintf(stderr, "enter compare_bitmaps(%d, %d, %d)\n", anchored,
         a1->rn->type, a2->rn->type); */
 
-#ifndef RC_DEFAULT_UNICODE
-    sz = ANYOF_BITMAP_SIZE;
-#else
     sz = (((a1->rn->flags & ANYOF_INVERT) &&
 	    (a1->rn->flags & ANYOF_NON_UTF8_LATIN1_ALL)) ||
 	(!(a2->rn->flags & ANYOF_INVERT) &&
 	    (a2->rn->flags & ANYOF_NON_UTF8_LATIN1_ALL))) ? 16
         : ANYOF_BITMAP_SIZE;
-#endif
     for (i = 0; i < sz; ++i)
     {
         loc1 = b1 ? b1[i] : get_bitmap_byte(a1->rn, i); 
@@ -1296,7 +1472,7 @@ static int compare_anyof_multiline(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert((a2->rn->type == MBOL) || (a2->rn->type == MEOL));
 
-    if (a1->rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
+    if (a1->rn->flags & ANYOF_UNICODE_ALL)
     {
 	return compare_mismatch(anchored, a1, a2);
     }
@@ -1335,25 +1511,37 @@ static int compare_anyof_anyof(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == ANYOF);
 
-#ifndef RC_DEFAULT_UNICODE
-    extra_left = a1->rn->flags & (ANYOF_UNICODE | ANYOF_LARGE);
-#else
     extra_left = ANYOF_NONBITMAP(a1->rn);
-#endif
     if ((extra_left || (a1->rn->flags & ANYOF_UNICODE_ALL)) &&
 	!(a2->rn->flags & ANYOF_UNICODE_ALL))
     {
         U32 m1, m2;
 	int cr1, cr2;
+
 	cr1 = convert_map(a1, &m1);
-	cr2 = convert_map(a2, &m2);
-	if ((cr1 == -1) || (cr2 == -1))
+	if (cr1 == -1)
 	{
 	    return -1;
 	}
 
+	cr2 = convert_map(a2, &m2);
+	if (cr2 == -1)
+	{
+	    return -1;
+	}
+
+	/* clearly this hould happen at a lower level, but there it
+	   breaks other paths... */
+	if (m2 & NOT_ALNUM_BLOCK)
+	{
+	    m2 |= NOT_ALPHA_BLOCK | NOT_NUMBER_BLOCK;
+	    m2 = extend_mask(m2);
+	}
+
 	if (!cr1 || !cr2 || (m1 & ~m2))
 	{
+	    /* fprintf(stderr, "cr1 = %d, cr2 = %d, m1 = 0x%x, m2 = 0x%x\n",
+		cr1, cr2, (unsigned)m1, (unsigned)m2); */
 	    return compare_mismatch(anchored, a1, a2);
 	}
     }
@@ -1382,6 +1570,7 @@ static int compare_short_byte_class(int anchored, Arrow *a1, Arrow *a2,
     return compare_tails(anchored, a1, a2);
 }
 
+#ifndef RC_POSIX_NODES
 static int compare_alnum_anyof(int anchored, Arrow *a1, Arrow *a2)
 {
     assert(a1->rn->type == ALNUM);
@@ -1404,7 +1593,15 @@ static int compare_alnum_anyof(int anchored, Arrow *a1, Arrow *a2)
 	}
     }
 
-    return compare_bitmaps(anchored, a1, a2, alphanumeric.bitmap, 0);
+    return compare_bitmaps(anchored, a1, a2, word_bc.bitmap, 0);
+}
+
+static int compare_alnuma_anyof(int anchored, Arrow *a1, Arrow *a2)
+{
+    assert(a1->rn->type == ALNUMA);
+    assert(a2->rn->type == ANYOF);
+
+    return compare_bitmaps(anchored, a1, a2, word_bc.bitmap, 0);
 }
 
 static int compare_nalnum_anyof(int anchored, Arrow *a1, Arrow *a2)
@@ -1427,12 +1624,26 @@ static int compare_nalnum_anyof(int anchored, Arrow *a1, Arrow *a2)
 	}
     }
 
-    return compare_bitmaps(anchored, a1, a2, alphanumeric.nbitmap, 0);
+    return compare_bitmaps(anchored, a1, a2, word_bc.nbitmap, 0);
+}
+
+static int compare_nalnuma_anyof(int anchored, Arrow *a1, Arrow *a2)
+{
+    assert(a1->rn->type == NALNUMA);
+    assert(a2->rn->type == ANYOF);
+
+    /* from perlre: all non-ASCII characters match ... "\W" */
+    if (!(a2->rn->flags & ANYOF_UNICODE_ALL))
+    {
+        return compare_mismatch(anchored, a1, a2);
+    }
+
+    return compare_bitmaps(anchored, a1, a2, word_bc.nbitmap, 0);
 }
 
 static int compare_space_anyof(int anchored, Arrow *a1, Arrow *a2)
 {
-    assert(a1->rn->type == SPACE);
+    assert((a1->rn->type == SPACE) || (a1->rn->type == SPACEA));
     assert(a2->rn->type == ANYOF);
 
     return compare_short_byte_class(anchored, a1, a2,  &whitespace);
@@ -1442,6 +1653,35 @@ static int compare_nspace_anyof(int anchored, Arrow *a1, Arrow *a2)
 {
     assert(a1->rn->type == NSPACE);
     assert(a2->rn->type == ANYOF);
+
+    if (!(a2->rn->flags & ANYOF_UNICODE_ALL))
+    {
+        U32 map;
+	int cr = convert_map(a2, &map);
+	if (cr == -1)
+	{
+	    return -1;
+	}
+
+	if (!cr || !(map & NOT_SPACE_BLOCK))
+	{
+	    return compare_mismatch(anchored, a1, a2);
+	}
+    }
+
+    return compare_bitmaps(anchored, a1, a2, whitespace.nbitmap, 0);
+}
+
+static int compare_nspacea_anyof(int anchored, Arrow *a1, Arrow *a2)
+{
+    assert(a1->rn->type == NSPACEA);
+    assert(a2->rn->type == ANYOF);
+
+    /* from perlre: all non-ASCII characters match ... "\S" */
+    if (!(a2->rn->flags & ANYOF_UNICODE_ALL))
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
 
     return compare_bitmaps(anchored, a1, a2, whitespace.nbitmap, 0);
 }
@@ -1494,6 +1734,206 @@ static int compare_negative_horizontal_space_anyof(int anchored, Arrow *a1, Arro
     return compare_bitmaps(anchored, a1, a2, horizontal_whitespace.nbitmap, 0);
 }
 
+static int compare_vertical_space_anyof(int anchored, Arrow *a1, Arrow *a2)
+{
+    assert(a1->rn->type == VERTWS);
+    assert(a2->rn->type == ANYOF);
+
+    if (!(a2->rn->flags & ANYOF_UNICODE_ALL))
+    {
+        U32 map;
+	int cr = convert_map(a2, &map);
+	if (cr == -1)
+	{
+	    return -1;
+	}
+
+	if (!cr || !(map & VERTICAL_SPACE_BLOCK))
+	{
+	    /* fprintf(stderr, "cr = %d, map = 0x%x\n", cr, (unsigned)map); */
+	    return compare_mismatch(anchored, a1, a2);
+	}
+    }
+
+    return compare_short_byte_class(anchored, a1, a2,  &vertical_whitespace);
+}
+
+static int compare_negative_vertical_space_anyof(int anchored, Arrow *a1, Arrow *a2)
+{
+    assert(a1->rn->type == NVERTWS);
+    assert(a2->rn->type == ANYOF);
+
+    if (!(a2->rn->flags & ANYOF_UNICODE_ALL))
+    {
+        U32 map;
+	int cr = convert_map(a2, &map);
+	if (cr == -1)
+	{
+	    return -1;
+	}
+
+	if (!cr || !(map & NOT_VERTICAL_SPACE_BLOCK))
+	{
+	    /* fprintf(stderr, "cr = %d, map = 0x%x\n", cr, (unsigned)map); */
+	    return compare_mismatch(anchored, a1, a2);
+	}
+    }
+
+    return compare_bitmaps(anchored, a1, a2, vertical_whitespace.nbitmap, 0);
+}
+#else
+static int compare_posix_posix(int anchored, Arrow *a1, Arrow *a2)
+{
+    U32 m1, m2;
+    int cr1, cr2;
+
+    /* fprintf(stderr, "enter compare_posix_posix\n"); */
+
+    cr1 = convert_class(a1, &m1);
+    cr2 = convert_class(a2, &m2);
+    if (!cr1 || !cr2 || (m1 & ~m2))
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
+
+    return compare_tails(anchored, a1, a2);
+}
+
+static int compare_posix_negative_posix(int anchored, Arrow *a1, Arrow *a2)
+{
+    U32 m1, m2;
+    int cr1, cr2;
+
+    /* fprintf(stderr, "enter compare_posix_negative_posix\n"); */
+
+    cr1 = convert_class(a1, &m1);
+    cr2 = convert_class(a2, &m2);
+    if (!cr1 || !cr2)
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
+
+    /* vertical space is not a strict subset of space, but it does
+       have space elements, so we have to require space on the right */
+    if ((m1 & VERTICAL_SPACE_BLOCK) && !(m2 & VERTICAL_SPACE_BLOCK))
+    {
+	m1 |= SPACE_BLOCK;
+    }
+
+    if (m1 & m2)
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
+
+    return compare_tails(anchored, a1, a2);
+}
+
+static int compare_negative_posix_negative_posix(int anchored, Arrow *a1, Arrow *a2)
+{
+    U32 m1, m2;
+    int cr1, cr2;
+
+    assert((a1->rn->type == NPOSIXD) || (a1->rn->type == NPOSIXU) ||
+	(a1->rn->type == NPOSIXA));
+    assert((a2->rn->type == NPOSIXD) || (a2->rn->type == NPOSIXU) ||
+	(a2->rn->type == NPOSIXA));
+
+    /* fprintf(stderr, "enter compare_negative_posix_negative_posix\n"); */
+
+    cr1 = convert_negative_class(a1, &m1);
+    cr2 = convert_negative_class(a2, &m2);
+    if (!cr2 || !cr2 || (m1 & ~m2))
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
+
+    return compare_tails(anchored, a1, a2);
+}
+
+static int compare_exact_posix(int anchored, Arrow *a1, Arrow *a2)
+{
+    char *seq;
+
+    assert((a1->rn->type == EXACT) || (a1->rn->type == EXACTF));
+    assert((a2->rn->type == POSIXD) || (a2->rn->type == POSIXU) ||
+	(a2->rn->type == POSIXA));
+
+    seq = GET_LITERAL(a1);
+
+    if (!_generic_isCC_A(*seq, a2->rn->flags))
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
+
+    return compare_tails(anchored, a1, a2);
+}
+
+static int compare_exactf_posix(int anchored, Arrow *a1, Arrow *a2)
+{
+    char *seq;
+    char unf[2];
+    int i;
+
+    assert(a1->rn->type == EXACTF);
+    assert(a2->rn->type == POSIXD);
+
+    seq = GET_LITERAL(a1);
+    init_unfolded(unf, *seq);
+
+    for (i = 0; i < 2; ++i)
+    {
+	if (!_generic_isCC_A(unf[i], a2->rn->flags))
+	{
+	    return compare_mismatch(anchored, a1, a2);
+	}
+    }
+
+    return compare_tails(anchored, a1, a2);
+}
+
+static int compare_exact_negative_posix(int anchored, Arrow *a1, Arrow *a2)
+{
+    char *seq;
+
+    assert(a1->rn->type == EXACT);
+    assert((a2->rn->type == NPOSIXD) || (a2->rn->type == NPOSIXU) ||
+	(a2->rn->type == NPOSIXA));
+
+    seq = GET_LITERAL(a1);
+
+    if (_generic_isCC_A(*seq, a2->rn->flags))
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
+
+    return compare_tails(anchored, a1, a2);
+}
+
+static int compare_exactf_negative_posix(int anchored, Arrow *a1, Arrow *a2)
+{
+    char *seq;
+    char unf[2];
+    int i;
+
+    assert(a1->rn->type == EXACTF);
+    assert((a2->rn->type == NPOSIXD) || (a2->rn->type == NPOSIXU) ||
+	(a2->rn->type == NPOSIXA));
+
+    seq = GET_LITERAL(a1);
+    init_unfolded(unf, *seq);
+
+    for (i = 0; i < 2; ++i)
+    {
+	if (_generic_isCC_A(unf[i], a2->rn->flags))
+	{
+	    return compare_mismatch(anchored, a1, a2);
+	}
+    }
+
+    return compare_tails(anchored, a1, a2);
+}
+#endif
+
 static int compare_reg_any_anyof(int anchored, Arrow *a1, Arrow *a2)
 {
     assert(a1->rn->type == REG_ANY);
@@ -1502,11 +1942,12 @@ static int compare_reg_any_anyof(int anchored, Arrow *a1, Arrow *a2)
     return compare_bitmaps(anchored, a1, a2, ndot.nbitmap, 0);
 }
 
+#ifndef RC_POSIX_NODES
 static int compare_digit_anyof(int anchored, Arrow *a1, Arrow *a2)
 {
     /* fprintf(stderr, "enter compare_digit_anyof\n"); */
 
-    assert(a1->rn->type == DIGIT);
+    assert((a1->rn->type == DIGIT) || (a1->rn->type == DIGITA));
     assert(a2->rn->type == ANYOF);
 
     /* fprintf(stderr, "right flags = %d\n", a2->rn->flags); */
@@ -1551,6 +1992,133 @@ static int compare_ndigit_anyof(int anchored, Arrow *a1, Arrow *a2)
 
     return compare_bitmaps(anchored, a1, a2, digit.nbitmap, 0);
 }
+
+static int compare_ndigita_anyof(int anchored, Arrow *a1, Arrow *a2)
+{
+    assert(a1->rn->type == NDIGITA);
+    assert(a2->rn->type == ANYOF);
+
+    /* from perlre: all non-ASCII characters match "\D"	*/
+    if (!(a2->rn->flags & ANYOF_UNICODE_ALL))
+    {
+        return compare_mismatch(anchored, a1, a2);
+    }
+
+    return compare_bitmaps(anchored, a1, a2, digit.nbitmap, 0);
+}
+#else
+static int compare_posix_anyof(int anchored, Arrow *a1, Arrow *a2)
+{
+    U32 left_block;
+    unsigned char *b;
+
+    /* fprintf(stderr, "enter compare_posix_anyof\n"); */
+
+    assert((a1->rn->type == POSIXD) || (a1->rn->type == POSIXU) ||
+	(a1->rn->type == POSIXA));
+    assert(a2->rn->type == ANYOF);
+
+    if (!convert_class_narrow(a1, &left_block))
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
+
+    /* fprintf(stderr, "right flags = %d\n", a2->rn->flags); */
+
+    if (!(a2->rn->flags & ANYOF_UNICODE_ALL))
+    {
+        U32 right_map;
+
+	/* apparently a special case... */
+	if (a2->rn->flags & ANYOF_INVERT)
+	{
+	    return compare_mismatch(anchored, a1, a2);
+	}
+
+	int cr = convert_map(a2, &right_map);
+	if (cr == -1)
+	{
+	    return -1;
+	}
+
+	if (!cr || !(right_map & left_block))
+	{
+	    return compare_mismatch(anchored, a1, a2);
+	}
+    }
+
+    if (a1->rn->flags >= SIZEOF_ARRAY(posix_regclass_bitmaps))
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
+
+    b = posix_regclass_bitmaps[a1->rn->flags];
+    if (!b)
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
+
+    return compare_bitmaps(anchored, a1, a2, b, 0);
+}
+
+static int compare_negative_posix_anyof(int anchored, Arrow *a1, Arrow *a2)
+{
+    U32 left_block;
+    unsigned char *b;
+
+    /* fprintf(stderr, "enter compare_negative_posix_anyof\n"); */
+
+    assert((a1->rn->type == NPOSIXD) || (a1->rn->type == NPOSIXU) ||
+        (a1->rn->type == NPOSIXA));
+    assert(a2->rn->type == ANYOF);
+
+    if (!convert_class_narrow(a1, &left_block))
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
+
+    left_block = EVERY_BLOCK & ~left_block;
+
+    /* fprintf(stderr, "left %d -> 0x%x\n", a1->rn->flags, (unsigned)left_block); */
+
+    if (!(a2->rn->flags & ANYOF_UNICODE_ALL))
+    {
+        U32 right_map;
+
+	/* analogically with compare_posix_anyof but untested */
+	if (a2->rn->flags & ANYOF_INVERT)
+	{
+	    return compare_mismatch(anchored, a1, a2);
+	}
+
+	int cr = convert_map(a2, &right_map);
+	if (cr == -1)
+	{
+	    return -1;
+	}
+
+	/* fprintf(stderr, "right map = 0x%x\n", (unsigned)right_map); */
+
+	if (!cr || !(right_map & left_block))
+	{
+	    return compare_mismatch(anchored, a1, a2);
+	}
+    }
+
+    if (a1->rn->flags >= SIZEOF_ARRAY(posix_regclass_bitmaps))
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
+
+    b = posix_regclass_nbitmaps[a1->rn->flags];
+    if (!b)
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
+
+    return compare_bitmaps(anchored, a1, a2, b, 0);
+}
+#endif
 
 static int compare_exact_anyof(int anchored, Arrow *a1, Arrow *a2)
 {
@@ -1626,30 +2194,39 @@ static int compare_exact_multiline(int anchored, Arrow *a1, Arrow *a2)
         ndot.lookup);
 }
 
+#ifndef RC_POSIX_NODES
 static int compare_exact_alnum(int anchored, Arrow *a1, Arrow *a2)
 {
     assert((a1->rn->type == EXACT) || (a1->rn->type == EXACTF));
-    assert(a2->rn->type == ALNUM);
+    assert((a2->rn->type == ALNUM) || (a2->rn->type == ALNUMA));
 
     return compare_exact_byte_class(anchored, a1, a2,
-        alphanumeric.lookup);
+        word_bc.lookup);
 }
 
 static int compare_exact_nalnum(int anchored, Arrow *a1, Arrow *a2)
 {
     assert((a1->rn->type == EXACT) || (a1->rn->type == EXACTF));
-    assert(a2->rn->type == NALNUM);
+    assert((a2->rn->type == NALNUM) || (a2->rn->type == NALNUMA));
 
     return compare_exact_byte_class(anchored, a1, a2,
-        alphanumeric.nlookup);
+        word_bc.nlookup);
 }
 
 static int compare_exact_space(int anchored, Arrow *a1, Arrow *a2)
 {
     assert((a1->rn->type == EXACT) || (a1->rn->type == EXACTF));
-    assert(a2->rn->type == SPACE);
+    assert((a2->rn->type == SPACE) || (a2->rn->type == SPACEA));
 
     return compare_exact_byte_class(anchored, a1, a2, whitespace.lookup);
+}
+
+static int compare_exact_nspace(int anchored, Arrow *a1, Arrow *a2)
+{
+    assert((a1->rn->type == EXACT) || (a1->rn->type == EXACTF));
+    assert((a2->rn->type == NSPACE) || (a2->rn->type == NSPACEA));
+
+    return compare_exact_byte_class(anchored, a1, a2, whitespace.nlookup);
 }
 
 static int compare_exact_horizontal_space(int anchored, Arrow *a1, Arrow *a2)
@@ -1670,18 +2247,28 @@ static int compare_exact_negative_horizontal_space(int anchored, Arrow *a1, Arro
         horizontal_whitespace.nlookup);
 }
 
-static int compare_exact_nspace(int anchored, Arrow *a1, Arrow *a2)
+static int compare_exact_vertical_space(int anchored, Arrow *a1, Arrow *a2)
 {
     assert((a1->rn->type == EXACT) || (a1->rn->type == EXACTF));
-    assert(a2->rn->type == NSPACE);
+    assert(a2->rn->type == VERTWS);
 
-    return compare_exact_byte_class(anchored, a1, a2, whitespace.nlookup);
+    return compare_exact_byte_class(anchored, a1, a2,
+        vertical_whitespace.lookup);
+}
+
+static int compare_exact_negative_vertical_space(int anchored, Arrow *a1, Arrow *a2)
+{
+    assert((a1->rn->type == EXACT) || (a1->rn->type == EXACTF));
+    assert(a2->rn->type == NVERTWS);
+
+    return compare_exact_byte_class(anchored, a1, a2,
+        vertical_whitespace.nlookup);
 }
 
 static int compare_exact_digit(int anchored, Arrow *a1, Arrow *a2)
 {
     assert((a1->rn->type == EXACT) || (a1->rn->type == EXACTF));
-    assert(a2->rn->type == DIGIT);
+    assert((a2->rn->type == DIGIT) || (a2->rn->type == DIGITA));
 
     return compare_exact_byte_class(anchored, a1, a2, digit.lookup);
 }
@@ -1689,22 +2276,16 @@ static int compare_exact_digit(int anchored, Arrow *a1, Arrow *a2)
 static int compare_exact_ndigit(int anchored, Arrow *a1, Arrow *a2)
 {
     assert((a1->rn->type == EXACT) || (a1->rn->type == EXACTF));
-    assert(a2->rn->type == NDIGIT);
+    assert((a2->rn->type == NDIGIT) || (a2->rn->type == NDIGITA));
 
     return compare_exact_byte_class(anchored, a1, a2, digit.nlookup);
 }
+#endif
 
 static int compare_anyof_reg_any(int anchored, Arrow *a1, Arrow *a2)
 {
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == REG_ANY);
-
-#if 0
-    if (a1->rn->flags & ANYOF_UNICODE)
-    {
-	return compare_mismatch(anchored, a1, a2);
-    }
-#endif
 
     return compare_bitmaps(anchored, a1, a2, 0, ndot.nbitmap);
 }
@@ -1717,30 +2298,74 @@ static int compare_exact_reg_any(int anchored, Arrow *a1, Arrow *a2)
     return compare_exact_byte_class(anchored, a1, a2, ndot.nlookup);
 }
 
+#ifndef RC_POSIX_NODES
+static int compare_anyof_class(int anchored, Arrow *a1, Arrow *a2,
+    U32 acceptable_mask, unsigned char *required_bitmap)
+{
+    if (a1->rn->flags & ANYOF_UNICODE_ALL)
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
+
+    if (ANYOF_NONBITMAP(a1->rn))
+    {
+        U32 m;
+
+	int cr = convert_map(a1, &m);
+	if (cr == -1)
+	{
+	    return -1;
+	}
+
+	/* fprintf(stderr, "m = 0x%x\n", (unsigned)m); */
+	if (!cr || (m & ~acceptable_mask))
+	{
+	    return compare_mismatch(anchored, a1, a2);
+	}
+    }
+
+    return compare_bitmaps(anchored, a1, a2, 0, required_bitmap);
+}
+
+static int compare_anyof_ascii_class(int anchored, Arrow *a1, Arrow *a2,
+    unsigned char *required_bitmap)
+{
+    if (ANYOF_NONBITMAP(a1->rn))
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
+
+    return compare_bitmaps(anchored, a1, a2, 0, required_bitmap);
+}
+
 static int compare_anyof_alnum(int anchored, Arrow *a1, Arrow *a2)
 {
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == ALNUM);
 
-    if (a1->rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
-    {
-	return compare_mismatch(anchored, a1, a2);
-    }
+    return compare_anyof_class(anchored, a1, a2,
+	ALNUM_BLOCK | ALPHA_BLOCK | NUMBER_BLOCK | UPPER_BLOCK | 
+	    LOWER_BLOCK | HEX_DIGIT_BLOCK,
+	word_bc.bitmap);
+}
 
-    return compare_bitmaps(anchored, a1, a2, 0, alphanumeric.bitmap);
+static int compare_anyof_alnuma(int anchored, Arrow *a1, Arrow *a2)
+{
+    assert(a1->rn->type == ANYOF);
+    assert(a2->rn->type == ALNUMA);
+
+    return compare_anyof_ascii_class(anchored, a1, a2,
+	word_bc.bitmap);
 }
 
 static int compare_anyof_nalnum(int anchored, Arrow *a1, Arrow *a2)
 {
     assert(a1->rn->type == ANYOF);
-    assert(a2->rn->type == NALNUM);
+    assert((a2->rn->type == NALNUM) || (a2->rn->type == NALNUMA));
 
-    if (a1->rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
-    {
-	return compare_mismatch(anchored, a1, a2);
-    }
-
-    return compare_bitmaps(anchored, a1, a2, 0, alphanumeric.nbitmap);
+    return compare_anyof_class(anchored, a1, a2,
+	SPACE_BLOCK | HORIZONTAL_SPACE_BLOCK | NOT_ALNUM_BLOCK,
+	word_bc.nbitmap);
 }
 
 static int compare_anyof_space(int anchored, Arrow *a1, Arrow *a2)
@@ -1748,12 +2373,30 @@ static int compare_anyof_space(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == SPACE);
 
-    if (a1->rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
-    {
-	return compare_mismatch(anchored, a1, a2);
-    }
+    return compare_anyof_class(anchored, a1, a2,
+	SPACE_BLOCK | HORIZONTAL_SPACE_BLOCK,
+	whitespace.bitmap);
+}
 
-    return compare_bitmaps(anchored, a1, a2, 0, whitespace.bitmap);
+static int compare_anyof_spacea(int anchored, Arrow *a1, Arrow *a2)
+{
+    assert(a1->rn->type == ANYOF);
+    assert(a2->rn->type == SPACEA);
+
+    return compare_anyof_ascii_class(anchored, a1, a2,
+	whitespace.bitmap);
+}
+
+static int compare_anyof_nspace(int anchored, Arrow *a1, Arrow *a2)
+{
+    assert(a1->rn->type == ANYOF);
+    assert((a2->rn->type == NSPACE) || (a2->rn->type == NSPACEA));
+
+    return compare_anyof_class(anchored, a1, a2,
+	ALNUM_BLOCK | ALPHA_BLOCK | NUMBER_BLOCK | UPPER_BLOCK |
+	    LOWER_BLOCK | HEX_DIGIT_BLOCK | NOT_HORIZONTAL_SPACE_BLOCK |
+	    NOT_SPACE_BLOCK,
+	whitespace.nbitmap);
 }
 
 static int compare_anyof_horizontal_space(int anchored, Arrow *a1, Arrow *a2)
@@ -1761,12 +2404,9 @@ static int compare_anyof_horizontal_space(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == HORIZWS);
 
-    if (a1->rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
-    {
-	return compare_mismatch(anchored, a1, a2);
-    }
-
-    return compare_bitmaps(anchored, a1, a2, 0, horizontal_whitespace.bitmap);
+    return compare_anyof_class(anchored, a1, a2,
+	HORIZONTAL_SPACE_BLOCK,
+	horizontal_whitespace.bitmap);
 }
 
 static int compare_anyof_negative_horizontal_space(int anchored, Arrow *a1, Arrow *a2)
@@ -1774,25 +2414,33 @@ static int compare_anyof_negative_horizontal_space(int anchored, Arrow *a1, Arro
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == NHORIZWS);
 
-    if (a1->rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
-    {
-	return compare_mismatch(anchored, a1, a2);
-    }
-
-    return compare_bitmaps(anchored, a1, a2, 0, horizontal_whitespace.nbitmap);
+    return compare_anyof_class(anchored, a1, a2,
+	ALNUM_BLOCK | ALPHA_BLOCK | NUMBER_BLOCK | UPPER_BLOCK |
+	    LOWER_BLOCK | HEX_DIGIT_BLOCK | NOT_HORIZONTAL_SPACE_BLOCK |
+	    NOT_SPACE_BLOCK,
+	horizontal_whitespace.nbitmap);
 }
 
-static int compare_anyof_nspace(int anchored, Arrow *a1, Arrow *a2)
+static int compare_anyof_vertical_space(int anchored, Arrow *a1, Arrow *a2)
 {
     assert(a1->rn->type == ANYOF);
-    assert(a2->rn->type == NSPACE);
+    assert(a2->rn->type == VERTWS);
 
-    if (a1->rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
-    {
-	return compare_mismatch(anchored, a1, a2);
-    }
+    return compare_anyof_class(anchored, a1, a2,
+	VERTICAL_SPACE_BLOCK,
+	vertical_whitespace.bitmap);
+}
 
-    return compare_bitmaps(anchored, a1, a2, 0, whitespace.nbitmap);
+static int compare_anyof_negative_vertical_space(int anchored, Arrow *a1, Arrow *a2)
+{
+    assert(a1->rn->type == ANYOF);
+    assert(a2->rn->type == NVERTWS);
+
+    return compare_anyof_class(anchored, a1, a2,
+	ALNUM_BLOCK | ALPHA_BLOCK | NUMBER_BLOCK | UPPER_BLOCK |
+	    LOWER_BLOCK | HEX_DIGIT_BLOCK | NOT_VERTICAL_SPACE_BLOCK |
+	    NOT_SPACE_BLOCK,
+	vertical_whitespace.nbitmap);
 }
 
 static int compare_anyof_digit(int anchored, Arrow *a1, Arrow *a2)
@@ -1800,26 +2448,155 @@ static int compare_anyof_digit(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == DIGIT);
 
-    if (a1->rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
-    {
-	return compare_mismatch(anchored, a1, a2);
-    }
+    return compare_anyof_class(anchored, a1, a2,
+	NUMBER_BLOCK,
+	digit.bitmap);
+}
 
-    return compare_bitmaps(anchored, a1, a2, 0, digit.bitmap);
+static int compare_anyof_digita(int anchored, Arrow *a1, Arrow *a2)
+{
+    assert(a1->rn->type == ANYOF);
+    assert(a2->rn->type == DIGITA);
+
+    return compare_anyof_ascii_class(anchored, a1, a2,
+	digit.bitmap);
 }
 
 static int compare_anyof_ndigit(int anchored, Arrow *a1, Arrow *a2)
 {
     assert(a1->rn->type == ANYOF);
-    assert(a2->rn->type == NDIGIT);
+    assert((a2->rn->type == NDIGIT) || (a2->rn->type == NDIGITA));
 
-    if (a1->rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
+    return compare_anyof_class(anchored, a1, a2,
+	SPACE_BLOCK | HORIZONTAL_SPACE_BLOCK | VERTICAL_SPACE_BLOCK |
+	NOT_ALNUM_BLOCK | NOT_NUMBER_BLOCK | NOT_HEX_DIGIT_BLOCK,
+	digit.nbitmap);
+}
+#else
+static int compare_anyof_posix(int anchored, Arrow *a1, Arrow *a2)
+{
+    unsigned char *b;
+
+    /* fprintf(stderr, "enter compare_anyof_posix\n"); */
+
+    assert(a1->rn->type == ANYOF);
+    assert(a2->rn->type == POSIXD);
+
+    if (a2->rn->flags >= SIZEOF_ARRAY(posix_regclass_bitmaps))
+    {
+        /* fprintf(stderr, "flags = %d\n", a2->rn->flags); */
+	return compare_mismatch(anchored, a1, a2);
+    }
+
+    b = posix_regclass_bitmaps[a2->rn->flags];
+    if (!b)
+    {
+        /* fprintf(stderr, "no bitmap for flags = %d\n", a2->rn->flags); */
+	return compare_mismatch(anchored, a1, a2);
+    }
+
+    return compare_bitmaps(anchored, a1, a2, 0, b);
+}
+
+static int compare_anyof_posixa(int anchored, Arrow *a1, Arrow *a2)
+{
+    unsigned char *b;
+
+    /* fprintf(stderr, "enter compare_anyof_posixa\n"); */
+
+    assert(a1->rn->type == ANYOF);
+    assert(a2->rn->type == POSIXA);
+
+    if (ANYOF_NONBITMAP(a1->rn))
     {
 	return compare_mismatch(anchored, a1, a2);
     }
 
-    return compare_bitmaps(anchored, a1, a2, 0, digit.nbitmap);
+    if (a2->rn->flags >= SIZEOF_ARRAY(posix_regclass_bitmaps))
+    {
+        /* fprintf(stderr, "flags = %d\n", a2->rn->flags); */
+	return compare_mismatch(anchored, a1, a2);
+    }
+
+    b = posix_regclass_bitmaps[a2->rn->flags];
+    if (!b)
+    {
+        /* fprintf(stderr, "no bitmap for flags = %d\n", a2->rn->flags); */
+	return compare_mismatch(anchored, a1, a2);
+    }
+
+    return compare_bitmaps(anchored, a1, a2, 0, b);
 }
+
+static int compare_anyof_negative_posix(int anchored, Arrow *a1, Arrow *a2)
+{
+    unsigned char *b;
+
+    /* fprintf(stderr, "enter compare_anyof_negative_posix\n"); */
+
+    assert(a1->rn->type == ANYOF);
+    assert((a2->rn->type == NPOSIXD) || (a2->rn->type == NPOSIXU) ||
+        (a2->rn->type == NPOSIXA));
+
+    if (a2->rn->flags >= SIZEOF_ARRAY(posix_regclass_nbitmaps))
+    {
+        /* fprintf(stderr, "flags = %d\n", a2->rn->flags); */
+	return compare_mismatch(anchored, a1, a2);
+    }
+
+    b = posix_regclass_nbitmaps[a2->rn->flags];
+    if (!b)
+    {
+        /* fprintf(stderr, "no negative bitmap for flags = %d\n", a2->rn->flags); */
+	return compare_mismatch(anchored, a1, a2);
+    }
+
+    return compare_bitmaps(anchored, a1, a2, 0, b);
+}
+
+static int compare_posix_reg_any(int anchored, Arrow *a1, Arrow *a2)
+{
+    assert((a1->rn->type == POSIXD) || (a1->rn->type == POSIXU) ||
+	(a1->rn->type == POSIXA));
+    assert(a2->rn->type == REG_ANY);
+
+    U8 flags = a1->rn->flags;
+    if (flags >= SIZEOF_ARRAY(newline_posix_regclasses))
+    {
+        /* fprintf(stderr, "unknown POSIX character class %d\n", flags); */
+        rc_error = "unknown POSIX character class";
+        return -1;
+    }
+
+    if (newline_posix_regclasses[flags])
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
+
+    return compare_tails(anchored, a1, a2);
+}
+
+static int compare_negative_posix_reg_any(int anchored, Arrow *a1, Arrow *a2)
+{
+    assert((a1->rn->type == NPOSIXD) || (a1->rn->type == NPOSIXU) ||
+        (a1->rn->type == NPOSIXA));
+    assert(a2->rn->type == REG_ANY);
+
+    U8 flags = a1->rn->flags;
+    if (flags >= SIZEOF_ARRAY(newline_posix_regclasses))
+    {
+        rc_error = "unknown negative POSIX character class";
+        return -1;
+    }
+
+    if (!newline_posix_regclasses[flags])
+    {
+	return compare_mismatch(anchored, a1, a2);
+    }
+
+    return compare_tails(anchored, a1, a2);
+}
+#endif
 
 static int compare_anyof_exact(int anchored, Arrow *a1, Arrow *a2)
 {
@@ -1831,7 +2608,7 @@ static int compare_anyof_exact(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == EXACT);
 
-    if (a1->rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
+    if (a1->rn->flags & ANYOF_UNICODE_ALL)
     {
 	return compare_mismatch(anchored, a1, a2);
     }
@@ -1862,7 +2639,7 @@ static int compare_anyof_exactf(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == EXACTF);
 
-    if (a1->rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
+    if (a1->rn->flags & ANYOF_UNICODE_ALL)
     {
 	return compare_mismatch(anchored, a1, a2);
     }
@@ -3018,7 +3795,11 @@ static int compare_curly_curly(int anchored, Arrow *a1, Arrow *a2)
 
 static int compare_bound(int anchored, Arrow *a1, Arrow *a2,
     int move_left, unsigned char *bitmap, char *lookup,
-    unsigned char *oktypes)
+    unsigned char *oktypes
+#ifdef RC_POSIX_NODES
+    , unsigned char *regclasses, U32 regclasses_size
+#endif
+    )
 {
     Arrow left, right;
     unsigned char t;
@@ -3035,7 +3816,7 @@ static int compare_bound(int anchored, Arrow *a1, Arrow *a2,
     }
 
     t = left.rn->type;
-    if (t >= TYPE_COUNT)
+    if (t >= REGNODE_MAX)
     {
         rc_error = "Invalid node type";
         return -1;
@@ -3044,7 +3825,7 @@ static int compare_bound(int anchored, Arrow *a1, Arrow *a2,
     {
         /* fprintf(stderr, "next is bitmap; flags = 0x%x\n", left.rn->flags); */
 
-        if (left.rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
+        if (left.rn->flags & ANYOF_UNICODE_ALL)
 	{
 	    return compare_mismatch(anchored, a1, a2);
 	}
@@ -3065,6 +3846,16 @@ static int compare_bound(int anchored, Arrow *a1, Arrow *a2,
 	    return compare_mismatch(anchored, a1, a2);
 	}
     }
+#ifdef RC_POSIX_NODES
+    else if ((t == POSIXD) || (t == NPOSIXD))
+    {
+      U8 flags = left.rn->flags;
+      if ((flags >= regclasses_size) || !regclasses[flags])
+      {
+	  return compare_mismatch(anchored, a1, a2);
+      }
+    }
+#endif
     else if (!oktypes[t])
     {
 	return compare_mismatch(anchored, a1, a2);
@@ -3082,26 +3873,42 @@ static int compare_bound(int anchored, Arrow *a1, Arrow *a2,
 
 static int compare_bol_word(int anchored, Arrow *a1, Arrow *a2)
 {
-    return compare_bound(anchored, a1, a2, 1, alphanumeric.bitmap,
-        alphanumeric.lookup, alphanumeric_classes);
+    return compare_bound(anchored, a1, a2, 1, word_bc.bitmap,
+        word_bc.lookup, alphanumeric_classes
+#ifdef RC_POSIX_NODES
+        , word_posix_regclasses, SIZEOF_ARRAY(word_posix_regclasses)
+#endif
+	);
 }
 
 static int compare_bol_nword(int anchored, Arrow *a1, Arrow *a2)
 {
-    return compare_bound(anchored, a1, a2, 1, alphanumeric.nbitmap,
-        alphanumeric.nlookup, non_alphanumeric_classes);
+    return compare_bound(anchored, a1, a2, 1, word_bc.nbitmap,
+        word_bc.nlookup, non_alphanumeric_classes
+#ifdef RC_POSIX_NODES
+        , non_word_posix_regclasses, SIZEOF_ARRAY(non_word_posix_regclasses)
+#endif
+	);
 }
 
 static int compare_next_word(int anchored, Arrow *a1, Arrow *a2)
 {
-    return compare_bound(anchored, a1, a2, 0, alphanumeric.bitmap,
-        alphanumeric.lookup, alphanumeric_classes);
+    return compare_bound(anchored, a1, a2, 0, word_bc.bitmap,
+        word_bc.lookup, alphanumeric_classes
+#ifdef RC_POSIX_NODES
+        , word_posix_regclasses, SIZEOF_ARRAY(word_posix_regclasses)
+#endif
+	);
 }
 
 static int compare_next_nword(int anchored, Arrow *a1, Arrow *a2)
 {
-    return compare_bound(anchored, a1, a2, 0, alphanumeric.nbitmap,
-        alphanumeric.nlookup, non_alphanumeric_classes);
+    return compare_bound(anchored, a1, a2, 0, word_bc.nbitmap,
+        word_bc.nlookup, non_alphanumeric_classes
+#ifdef RC_POSIX_NODES
+        , non_word_posix_regclasses, SIZEOF_ARRAY(non_word_posix_regclasses)
+#endif
+	);
 }
 
 static int compare_anyof_bounds(int anchored, Arrow *a1, Arrow *a2,
@@ -3153,12 +3960,12 @@ static int compare_anyof_bound(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == BOUND);
 
-    if (a1->rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
+    if (a1->rn->flags & ANYOF_UNICODE_ALL)
     {
 	return compare_mismatch(anchored, a1, a2);
     }
 
-    return compare_anyof_bounds(anchored, a1, a2, alphanumeric.nbitmap);
+    return compare_anyof_bounds(anchored, a1, a2, word_bc.nbitmap);
 }
 
 static int compare_anyof_nbound(int anchored, Arrow *a1, Arrow *a2)
@@ -3166,12 +3973,12 @@ static int compare_anyof_nbound(int anchored, Arrow *a1, Arrow *a2)
     assert(a1->rn->type == ANYOF);
     assert(a2->rn->type == NBOUND);
 
-    if (a1->rn->flags & (ANYOF_UNICODE | ANYOF_UNICODE_ALL))
+    if (a1->rn->flags & ANYOF_UNICODE_ALL)
     {
 	return compare_mismatch(anchored, a1, a2);
     }
 
-    return compare_anyof_bounds(anchored, a1, a2, alphanumeric.bitmap);
+    return compare_anyof_bounds(anchored, a1, a2, word_bc.bitmap);
 }
 
 static int compare_exact_bound(int anchored, Arrow *a1, Arrow *a2)
@@ -3184,7 +3991,7 @@ static int compare_exact_bound(int anchored, Arrow *a1, Arrow *a2)
 
     seq = GET_LITERAL(a1);
 
-    cmp = alphanumeric.lookup[(unsigned char)(*seq)] ?
+    cmp = word_bc.lookup[(unsigned char)(*seq)] ?
         compare_next_nword : compare_next_word;
     return cmp(anchored, a1, a2);
 }
@@ -3199,10 +4006,86 @@ static int compare_exact_nbound(int anchored, Arrow *a1, Arrow *a2)
 
     seq = GET_LITERAL(a1);
 
-    cmp = alphanumeric.lookup[(unsigned char)(*seq)] ?
+    cmp = word_bc.lookup[(unsigned char)(*seq)] ?
         compare_next_word : compare_next_nword;
     return cmp(anchored, a1, a2);
 }
+
+#ifdef RC_POSIX_NODES
+static int compare_posix_bound(int anchored, Arrow *a1, Arrow *a2)
+{
+    assert((a1->rn->type == POSIXD) || (a1->rn->type == POSIXU) ||
+	(a1->rn->type == POSIXA));
+    assert(a2->rn->type == BOUND);
+
+    U8 flags = a1->rn->flags;
+    if ((flags >= SIZEOF_ARRAY(word_posix_regclasses)) ||
+	(flags >= SIZEOF_ARRAY(non_word_posix_regclasses)) ||
+	(!word_posix_regclasses[flags] && !non_word_posix_regclasses[flags]))
+    {
+        return compare_mismatch(anchored, a1, a2);
+    }
+
+    assert(!word_posix_regclasses[flags] || !non_word_posix_regclasses[flags]);
+
+    FCompare cmp = word_posix_regclasses[flags] ? 
+        compare_next_nword : compare_next_word;
+    return cmp(anchored, a1, a2);
+}
+
+static int compare_posix_nbound(int anchored, Arrow *a1, Arrow *a2)
+{
+    assert((a1->rn->type == POSIXD) || (a1->rn->type == POSIXU) ||
+	(a1->rn->type == POSIXA));
+    assert(a2->rn->type == NBOUND);
+
+    U8 flags = a1->rn->flags;
+    if ((flags >= SIZEOF_ARRAY(word_posix_regclasses)) ||
+	(flags >= SIZEOF_ARRAY(non_word_posix_regclasses)) ||
+	(!word_posix_regclasses[flags] && !non_word_posix_regclasses[flags]))
+    {
+        return compare_mismatch(anchored, a1, a2);
+    }
+
+    assert(!word_posix_regclasses[flags] || !non_word_posix_regclasses[flags]);
+
+    FCompare cmp = word_posix_regclasses[flags] ? 
+        compare_next_word : compare_next_nword;
+    return cmp(anchored, a1, a2);
+}
+
+static int compare_negative_posix_word_bound(int anchored, Arrow *a1, Arrow *a2)
+{
+    assert((a1->rn->type == NPOSIXD) || (a1->rn->type == NPOSIXU) ||
+	(a1->rn->type == NPOSIXA));
+    assert(a2->rn->type == BOUND);
+
+    /* we could accept _CC_ALPHANUMERIC as well but let's postpone it
+       until we see the need */
+    if (a1->rn->flags != _CC_WORDCHAR)
+    {
+        return compare_mismatch(anchored, a1, a2);
+    }
+
+    return compare_next_word(anchored, a1, a2);
+}
+
+static int compare_negative_posix_word_nbound(int anchored, Arrow *a1, Arrow *a2)
+{
+    assert((a1->rn->type == NPOSIXD) || (a1->rn->type == NPOSIXU) ||
+	(a1->rn->type == NPOSIXA));
+    assert(a2->rn->type == NBOUND);
+
+    /* we could accept _CC_ALPHANUMERIC as well but let's postpone it
+       until we see the need */
+    if (a1->rn->flags != _CC_WORDCHAR)
+    {
+        return compare_mismatch(anchored, a1, a2);
+    }
+
+    return compare_next_nword(anchored, a1, a2);
+}
+#endif
 
 static int compare_open_open(int anchored, Arrow *a1, Arrow *a2)
 {
@@ -3296,7 +4179,7 @@ static int compare(int anchored, Arrow *a1, Arrow *a2)
     /* fprintf(stderr, "enter compare(%d, %d, %d)\n", anchored,
        a1->rn->type, a2->rn->type); */
 
-    if ((a1->rn->type >= TYPE_COUNT) || (a2->rn->type >= TYPE_COUNT))
+    if ((a1->rn->type >= REGNODE_MAX) || (a2->rn->type >= REGNODE_MAX))
     {
         rc_error = "Invalid regexp node type";
         return -1;
@@ -3326,6 +4209,8 @@ void rc_init()
         SIZEOF_ARRAY(whitespace_expl));
     init_byte_class(&horizontal_whitespace, horizontal_whitespace_expl,
         SIZEOF_ARRAY(horizontal_whitespace_expl));
+    init_byte_class(&vertical_whitespace, vertical_whitespace_expl,
+        SIZEOF_ARRAY(vertical_whitespace_expl));
 
     for (i = 0; i < SIZEOF_ARRAY(digit_expl); ++i)
     {
@@ -3333,6 +4218,22 @@ void rc_init()
     }
 
     init_byte_class(&digit, digit_expl, SIZEOF_ARRAY(digit_expl));
+
+    memcpy(xdigit_expl, digit_expl, 10 * sizeof(char));
+
+    wstart = 10;
+    for (i = 0; i < 6; ++i)
+    {
+        xdigit_expl[wstart + i] = 'a' + i;
+    }
+
+    wstart += 6;
+    for (i = 0; i < 6; ++i)
+    {
+        xdigit_expl[wstart + i] = 'A' + i;
+    }
+
+    init_byte_class(&xdigit, xdigit_expl, SIZEOF_ARRAY(xdigit_expl));
 
     init_byte_class(&ndot, ndot_expl, SIZEOF_ARRAY(ndot_expl));
 
@@ -3353,30 +4254,65 @@ void rc_init()
 	alphanumeric_expl[wstart + i] = 'A' + i;
     }
 
-    init_byte_class(&alphanumeric, alphanumeric_expl,
+    init_byte_class(&word_bc, alphanumeric_expl,
         SIZEOF_ARRAY(alphanumeric_expl));
+    init_byte_class(&alnum_bc, alphanumeric_expl + 1,
+        SIZEOF_ARRAY(alphanumeric_expl) - 1);
 
     memset(alphanumeric_classes, 0, SIZEOF_ARRAY(alphanumeric_classes));
+#ifndef RC_POSIX_NODES
     alphanumeric_classes[ALNUM] = alphanumeric_classes[DIGIT] = 1;
+#endif
 
     memset(non_alphanumeric_classes, 0,
 	SIZEOF_ARRAY(non_alphanumeric_classes));
+#ifndef RC_POSIX_NODES
     non_alphanumeric_classes[NALNUM] = non_alphanumeric_classes[SPACE] = 
+#endif
         non_alphanumeric_classes[EOS] = non_alphanumeric_classes[EOL] = 
         non_alphanumeric_classes[SEOL] = 1;
+
+#ifdef RC_POSIX_NODES
+    memset(word_posix_regclasses, 0,
+        SIZEOF_ARRAY(word_posix_regclasses));
+    word_posix_regclasses[_CC_WORDCHAR] = 
+        word_posix_regclasses[_CC_DIGIT] = 
+        word_posix_regclasses[_CC_ALPHA] = 
+        word_posix_regclasses[_CC_LOWER] = 
+        word_posix_regclasses[_CC_UPPER] = 
+        word_posix_regclasses[_CC_UPPER] = 
+        word_posix_regclasses[_CC_ALPHANUMERIC] =
+        word_posix_regclasses[_CC_CASED] =
+        word_posix_regclasses[_CC_XDIGIT] = 1;
+
+    memset(non_word_posix_regclasses, 0,
+        SIZEOF_ARRAY(non_word_posix_regclasses));
+    non_word_posix_regclasses[_CC_PUNCT] =
+        non_word_posix_regclasses[_CC_SPACE] =
+        non_word_posix_regclasses[_CC_BLANK] =
+        non_word_posix_regclasses[_CC_PSXSPC] =
+        non_word_posix_regclasses[_CC_VERTSPACE] = 1;
+
+    memset(newline_posix_regclasses, 0,
+        SIZEOF_ARRAY(newline_posix_regclasses));
+    newline_posix_regclasses[_CC_SPACE] = 
+        newline_posix_regclasses[_CC_CNTRL] =
+        newline_posix_regclasses[_CC_ASCII] =
+        newline_posix_regclasses[_CC_VERTSPACE] = 1;
+#endif
 
     memset(trivial_nodes, 0, SIZEOF_ARRAY(trivial_nodes));
     trivial_nodes[SUCCEED] = trivial_nodes[NOTHING] =
         trivial_nodes[TAIL] = trivial_nodes[WHILEM] = 1;
 
-    memset(dispatch, 0, sizeof(FCompare) * TYPE_COUNT * TYPE_COUNT);
+    memset(dispatch, 0, sizeof(FCompare) * REGNODE_MAX * REGNODE_MAX);
 
-    for (i = 0; i < TYPE_COUNT; ++i)
+    for (i = 0; i < REGNODE_MAX; ++i)
     {
 	dispatch[i][END] = success;
     }
 
-    for (i = 0; i < TYPE_COUNT; ++i)
+    for (i = 0; i < REGNODE_MAX; ++i)
     {
 	dispatch[i][SUCCEED] = compare_next;
     }
@@ -3409,12 +4345,27 @@ void rc_init()
     dispatch[REG_ANY][MBOL] = compare_mismatch;
     dispatch[SANY][MBOL] = compare_mismatch;
     dispatch[ANYOF][MBOL] = compare_anyof_multiline;
+#ifndef RC_POSIX_NODES
     dispatch[ALNUM][MBOL] = compare_mismatch;
-    dispatch[NALNUM][MBOL] = compare_mismatch;
+    dispatch[ALNUMA][MBOL] = compare_mismatch;
+    dispatch[NALNUM][MBOL] = compare_mismatch; 
+    dispatch[NALNUMA][MBOL] = compare_mismatch;
     dispatch[SPACE][MBOL] = compare_mismatch;
+    dispatch[SPACEA][MBOL] = compare_mismatch;
     dispatch[NSPACE][MBOL] = compare_mismatch;
+    dispatch[NSPACEA][MBOL] = compare_mismatch;
     dispatch[DIGIT][MBOL] = compare_mismatch;
+    dispatch[DIGITA][MBOL] = compare_mismatch;
     dispatch[NDIGIT][MBOL] = compare_mismatch;
+    dispatch[NDIGITA][MBOL] = compare_mismatch;
+#else
+    dispatch[POSIXD][MBOL] = compare_mismatch;
+    dispatch[POSIXU][MBOL] = compare_mismatch;
+    dispatch[POSIXA][MBOL] = compare_mismatch;
+    dispatch[NPOSIXD][MBOL] = compare_mismatch;
+    dispatch[NPOSIXU][MBOL] = compare_mismatch;
+    dispatch[NPOSIXA][MBOL] = compare_mismatch;
+#endif
     dispatch[BRANCH][MBOL] = compare_left_branch;
     dispatch[EXACT][MBOL] = compare_exact_multiline;
     dispatch[EXACTF][MBOL] = compare_exact_multiline;
@@ -3431,8 +4382,12 @@ void rc_init()
     dispatch[IFMATCH][MBOL] = compare_after_assertion;
     dispatch[UNLESSM][MBOL] = compare_after_assertion;
     dispatch[MINMOD][MBOL] = compare_left_tail;
+#ifndef RC_POSIX_NODES
+    dispatch[VERTWS][MBOL] = compare_mismatch;
+    dispatch[NVERTWS][MBOL] = compare_mismatch;
     dispatch[HORIZWS][MBOL] = compare_mismatch;
     dispatch[NHORIZWS][MBOL] = compare_mismatch;
+#endif
     dispatch[OPTIMIZED][MBOL] = compare_left_tail;
 
     dispatch[SUCCEED][SBOL] = compare_left_tail;
@@ -3502,12 +4457,27 @@ void rc_init()
     dispatch[REG_ANY][MEOL] = compare_mismatch;
     dispatch[SANY][MEOL] = compare_mismatch;
     dispatch[ANYOF][MEOL] = compare_anyof_multiline;
+#ifndef RC_POSIX_NODES
     dispatch[ALNUM][MEOL] = compare_mismatch;
+    dispatch[ALNUMA][MEOL] = compare_mismatch;
     dispatch[NALNUM][MEOL] = compare_mismatch;
+    dispatch[NALNUMA][MEOL] = compare_mismatch;
     dispatch[SPACE][MEOL] = compare_mismatch;
+    dispatch[SPACEA][MEOL] = compare_mismatch;
     dispatch[NSPACE][MEOL] = compare_mismatch;
+    dispatch[NSPACEA][MEOL] = compare_mismatch;
     dispatch[DIGIT][MEOL] = compare_mismatch;
+    dispatch[DIGITA][MEOL] = compare_mismatch;
     dispatch[NDIGIT][MEOL] = compare_mismatch;
+    dispatch[NDIGITA][MEOL] = compare_mismatch;
+#else
+    dispatch[POSIXD][MEOL] = compare_mismatch;
+    dispatch[POSIXU][MEOL] = compare_mismatch;
+    dispatch[POSIXA][MEOL] = compare_mismatch;
+    dispatch[NPOSIXD][MEOL] = compare_mismatch;
+    dispatch[NPOSIXU][MEOL] = compare_mismatch;
+    dispatch[NPOSIXA][MEOL] = compare_mismatch;
+#endif
     dispatch[BRANCH][MEOL] = compare_left_branch;
     dispatch[EXACT][MEOL] = compare_exact_multiline;
     dispatch[EXACTF][MEOL] = compare_exact_multiline;
@@ -3524,8 +4494,12 @@ void rc_init()
     dispatch[IFMATCH][MEOL] = compare_after_assertion;
     dispatch[UNLESSM][MEOL] = compare_after_assertion;
     dispatch[MINMOD][MEOL] = compare_left_tail;
+#ifndef RC_POSIX_NODES
+    dispatch[VERTWS][MEOL] = compare_mismatch;
+    dispatch[NVERTWS][MEOL] = compare_mismatch;
     dispatch[HORIZWS][MEOL] = compare_mismatch;
     dispatch[NHORIZWS][MEOL] = compare_mismatch;
+#endif
     dispatch[OPTIMIZED][MEOL] = compare_left_tail;
 
     dispatch[SUCCEED][SEOL] = compare_left_tail;
@@ -3534,6 +4508,27 @@ void rc_init()
     dispatch[SEOL][SEOL] = compare_tails;
     dispatch[BRANCH][SEOL] = compare_left_branch;
     dispatch[NOTHING][SEOL] = compare_left_tail;
+#ifndef RC_POSIX_NODES
+    dispatch[ALNUM][SEOL] = compare_mismatch;
+    dispatch[ALNUMA][SEOL] = compare_mismatch;
+    dispatch[NALNUM][SEOL] = compare_mismatch;
+    dispatch[NALNUMA][SEOL] = compare_mismatch;
+    dispatch[SPACE][SEOL] = compare_mismatch;
+    dispatch[SPACEA][SEOL] = compare_mismatch;
+    dispatch[NSPACE][SEOL] = compare_mismatch;
+    dispatch[NSPACEA][SEOL] = compare_mismatch;
+    dispatch[DIGIT][SEOL] = compare_mismatch;
+    dispatch[NDIGIT][SEOL] = compare_mismatch;
+    dispatch[DIGITA][SEOL] = compare_mismatch;
+    dispatch[NDIGITA][SEOL] = compare_mismatch;
+#else
+    dispatch[POSIXD][SEOL] = compare_mismatch;
+    dispatch[POSIXU][SEOL] = compare_mismatch;
+    dispatch[POSIXA][SEOL] = compare_mismatch;
+    dispatch[NPOSIXD][SEOL] = compare_mismatch;
+    dispatch[NPOSIXU][SEOL] = compare_mismatch;
+    dispatch[NPOSIXA][SEOL] = compare_mismatch;
+#endif
     dispatch[TAIL][SEOL] = compare_left_tail;
     dispatch[STAR][SEOL] = 0;
     dispatch[PLUS][SEOL] = compare_left_plus;
@@ -3546,6 +4541,12 @@ void rc_init()
     dispatch[IFMATCH][SEOL] = compare_after_assertion;
     dispatch[UNLESSM][SEOL] = compare_after_assertion;
     dispatch[MINMOD][SEOL] = compare_left_tail;
+#ifndef RC_POSIX_NODES
+    dispatch[VERTWS][SEOL] = compare_mismatch;
+    dispatch[NVERTWS][SEOL] = compare_mismatch;
+    dispatch[HORIZWS][SEOL] = compare_mismatch;
+    dispatch[NHORIZWS][SEOL] = compare_mismatch;
+#endif
     dispatch[OPTIMIZED][SEOL] = compare_left_tail;
 
     dispatch[SUCCEED][BOUND] = compare_left_tail;
@@ -3557,12 +4558,27 @@ void rc_init()
     dispatch[REG_ANY][BOUND] = compare_mismatch;
     dispatch[SANY][BOUND] = compare_mismatch;
     dispatch[ANYOF][BOUND] = compare_anyof_bound;
+#ifndef RC_POSIX_NODES
     dispatch[ALNUM][BOUND] = compare_next_nword;
+    dispatch[ALNUMA][BOUND] = compare_next_nword;
     dispatch[NALNUM][BOUND] = compare_next_word;
+    dispatch[NALNUMA][BOUND] = compare_next_word;
     dispatch[SPACE][BOUND] = compare_next_word;
+    dispatch[SPACEA][BOUND] = compare_next_word;
     dispatch[NSPACE][BOUND] = compare_mismatch;
+    dispatch[NSPACEA][BOUND] = compare_mismatch;
     dispatch[DIGIT][BOUND] = compare_next_nword;
+    dispatch[DIGITA][BOUND] = compare_next_nword;
     dispatch[NDIGIT][BOUND] = compare_mismatch;
+    dispatch[NDIGITA][BOUND] = compare_mismatch;
+#else
+    dispatch[POSIXD][BOUND] = compare_posix_bound;
+    dispatch[POSIXU][BOUND] = compare_posix_bound;
+    dispatch[POSIXA][BOUND] = compare_posix_bound;
+    dispatch[NPOSIXD][BOUND] = compare_negative_posix_word_bound;
+    dispatch[NPOSIXU][BOUND] = compare_mismatch; /* should be replaced, needs extra test */
+    dispatch[NPOSIXA][BOUND] = compare_negative_posix_word_bound;
+#endif
     dispatch[BRANCH][BOUND] = compare_left_branch;
     dispatch[EXACT][BOUND] = compare_exact_bound;
     dispatch[EXACTF][BOUND] = compare_exact_bound;
@@ -3577,8 +4593,12 @@ void rc_init()
     dispatch[IFMATCH][BOUND] = compare_after_assertion;
     dispatch[UNLESSM][BOUND] = compare_after_assertion;
     dispatch[MINMOD][BOUND] = compare_left_tail;
+#ifndef RC_POSIX_NODES
+    dispatch[VERTWS][BOUND] = compare_next_word;
+    dispatch[NVERTWS][BOUND] = compare_mismatch;
     dispatch[HORIZWS][BOUND] = compare_next_word;
     dispatch[NHORIZWS][BOUND] = compare_mismatch;
+#endif
     dispatch[OPTIMIZED][BOUND] = compare_left_tail;
 
     dispatch[SUCCEED][NBOUND] = compare_left_tail;
@@ -3590,12 +4610,27 @@ void rc_init()
     dispatch[REG_ANY][NBOUND] = compare_mismatch;
     dispatch[SANY][NBOUND] = compare_mismatch;
     dispatch[ANYOF][NBOUND] = compare_anyof_nbound;
+#ifndef RC_POSIX_NODES
     dispatch[ALNUM][NBOUND] = compare_next_word;
+    dispatch[ALNUMA][NBOUND] = compare_next_word;
     dispatch[NALNUM][NBOUND] = compare_next_nword;
+    dispatch[NALNUMA][NBOUND] = compare_next_nword;
     dispatch[SPACE][NBOUND] = compare_next_nword;
+    dispatch[SPACEA][NBOUND] = compare_next_nword;
     dispatch[NSPACE][NBOUND] = compare_mismatch;
+    dispatch[NSPACEA][NBOUND] = compare_mismatch;
     dispatch[DIGIT][NBOUND] = compare_next_word;
+    dispatch[DIGITA][NBOUND] = compare_next_word;
     dispatch[NDIGIT][NBOUND] = compare_mismatch;
+    dispatch[NDIGITA][NBOUND] = compare_mismatch;
+#else
+    dispatch[POSIXD][NBOUND] = compare_posix_nbound;
+    dispatch[POSIXU][NBOUND] = compare_posix_nbound;
+    dispatch[POSIXA][NBOUND] = compare_posix_nbound;
+    dispatch[NPOSIXD][NBOUND] = compare_negative_posix_word_nbound;
+    dispatch[NPOSIXU][NBOUND] = compare_negative_posix_word_nbound;
+    dispatch[NPOSIXA][NBOUND] = compare_negative_posix_word_nbound;
+#endif
     dispatch[BRANCH][NBOUND] = compare_left_branch;
     dispatch[EXACT][NBOUND] = compare_exact_nbound;
     dispatch[EXACTF][NBOUND] = compare_exact_nbound;
@@ -3610,8 +4645,12 @@ void rc_init()
     dispatch[IFMATCH][NBOUND] = compare_after_assertion;
     dispatch[UNLESSM][NBOUND] = compare_after_assertion;
     dispatch[MINMOD][NBOUND] = compare_left_tail;
+#ifndef RC_POSIX_NODES
+    dispatch[VERTWS][NBOUND] = compare_next_nword;
+    dispatch[NVERTWS][NBOUND] = compare_mismatch;
     dispatch[HORIZWS][NBOUND] = compare_next_nword;
     dispatch[NHORIZWS][NBOUND] = compare_mismatch;
+#endif
     dispatch[OPTIMIZED][NBOUND] = compare_left_tail;
 
     dispatch[SUCCEED][REG_ANY] = compare_left_tail;
@@ -3623,12 +4662,27 @@ void rc_init()
     dispatch[REG_ANY][REG_ANY] = compare_tails;
     dispatch[SANY][REG_ANY] = compare_mismatch;
     dispatch[ANYOF][REG_ANY] = compare_anyof_reg_any;
+#ifndef RC_POSIX_NODES
     dispatch[ALNUM][REG_ANY] = compare_tails;
+    dispatch[ALNUMA][REG_ANY] = compare_tails;
     dispatch[NALNUM][REG_ANY] = compare_mismatch;
+    dispatch[NALNUMA][REG_ANY] = compare_mismatch;
     dispatch[SPACE][REG_ANY] = compare_mismatch;
+    dispatch[SPACEA][REG_ANY] = compare_mismatch;
     dispatch[NSPACE][REG_ANY] = compare_tails;
+    dispatch[NSPACEA][REG_ANY] = compare_tails;
     dispatch[DIGIT][REG_ANY] = compare_tails;
+    dispatch[DIGITA][REG_ANY] = compare_tails;
     dispatch[NDIGIT][REG_ANY] = compare_mismatch;
+    dispatch[NDIGITA][REG_ANY] = compare_mismatch;
+#else
+    dispatch[POSIXD][REG_ANY] = compare_posix_reg_any;
+    dispatch[POSIXU][REG_ANY] = compare_posix_reg_any;
+    dispatch[POSIXA][REG_ANY] = compare_posix_reg_any;
+    dispatch[NPOSIXD][REG_ANY] = compare_negative_posix_reg_any;
+    dispatch[NPOSIXU][REG_ANY] = compare_negative_posix_reg_any;
+    dispatch[NPOSIXA][REG_ANY] = compare_negative_posix_reg_any;
+#endif
     dispatch[BRANCH][REG_ANY] = compare_left_branch;
     dispatch[EXACT][REG_ANY] = compare_exact_reg_any;
     dispatch[EXACTF][REG_ANY] = compare_exact_reg_any;
@@ -3645,8 +4699,12 @@ void rc_init()
     dispatch[IFMATCH][REG_ANY] = compare_after_assertion;
     dispatch[UNLESSM][REG_ANY] = compare_after_assertion;
     dispatch[MINMOD][REG_ANY] = compare_left_tail;
+#ifndef RC_POSIX_NODES
+    dispatch[VERTWS][REG_ANY] = compare_mismatch;
+    dispatch[NVERTWS][REG_ANY] = compare_mismatch;
     dispatch[HORIZWS][REG_ANY] = compare_tails;
     dispatch[NHORIZWS][REG_ANY] = compare_mismatch;
+#endif
     dispatch[OPTIMIZED][REG_ANY] = compare_left_tail;
 
     dispatch[SUCCEED][SANY] = compare_left_tail;
@@ -3658,12 +4716,27 @@ void rc_init()
     dispatch[REG_ANY][SANY] = compare_tails;
     dispatch[SANY][SANY] = compare_tails;
     dispatch[ANYOF][SANY] = compare_tails;
+#ifndef RC_POSIX_NODES
     dispatch[ALNUM][SANY] = compare_tails;
+    dispatch[ALNUMA][SANY] = compare_tails;
     dispatch[NALNUM][SANY] = compare_tails;
+    dispatch[NALNUMA][SANY] = compare_tails;
     dispatch[SPACE][SANY] = compare_tails;
+    dispatch[SPACEA][SANY] = compare_tails;
     dispatch[NSPACE][SANY] = compare_tails;
+    dispatch[NSPACEA][SANY] = compare_tails;
     dispatch[DIGIT][SANY] = compare_tails;
+    dispatch[DIGITA][SANY] = compare_tails;
     dispatch[NDIGIT][SANY] = compare_tails;
+    dispatch[NDIGITA][SANY] = compare_tails;
+#else
+    dispatch[POSIXD][SANY] = compare_tails;
+    dispatch[POSIXU][SANY] = compare_tails;
+    dispatch[POSIXA][SANY] = compare_tails;
+    dispatch[NPOSIXD][SANY] = compare_tails;
+    dispatch[NPOSIXU][SANY] = compare_tails;
+    dispatch[NPOSIXA][SANY] = compare_tails;
+#endif
     dispatch[BRANCH][SANY] = compare_left_branch;
     dispatch[EXACT][SANY] = compare_tails;
     dispatch[EXACTF][SANY] = compare_tails;
@@ -3680,8 +4753,12 @@ void rc_init()
     dispatch[IFMATCH][SANY] = compare_after_assertion;
     dispatch[UNLESSM][SANY] = compare_after_assertion;
     dispatch[MINMOD][SANY] = compare_left_tail;
+#ifndef RC_POSIX_NODES
+    dispatch[VERTWS][SANY] = compare_tails;
+    dispatch[NVERTWS][SANY] = compare_tails;
     dispatch[HORIZWS][SANY] = compare_tails;
     dispatch[NHORIZWS][SANY] = compare_tails;
+#endif
     dispatch[OPTIMIZED][SANY] = compare_left_tail;
 
     dispatch[SUCCEED][ANYOF] = compare_left_tail;
@@ -3693,12 +4770,27 @@ void rc_init()
     dispatch[REG_ANY][ANYOF] = compare_reg_any_anyof;
     dispatch[SANY][ANYOF] = compare_mismatch;
     dispatch[ANYOF][ANYOF] = compare_anyof_anyof;
+#ifndef RC_POSIX_NODES
     dispatch[ALNUM][ANYOF] = compare_alnum_anyof;
+    dispatch[ALNUMA][ANYOF] = compare_alnuma_anyof;
     dispatch[NALNUM][ANYOF] = compare_nalnum_anyof;
+    dispatch[NALNUMA][ANYOF] = compare_nalnuma_anyof;
     dispatch[SPACE][ANYOF] = compare_space_anyof;
+    dispatch[SPACEA][ANYOF] = compare_space_anyof;
     dispatch[NSPACE][ANYOF] = compare_nspace_anyof;
+    dispatch[NSPACEA][ANYOF] = compare_nspacea_anyof;
     dispatch[DIGIT][ANYOF] = compare_digit_anyof;
+    dispatch[DIGITA][ANYOF] = compare_digit_anyof;
     dispatch[NDIGIT][ANYOF] = compare_ndigit_anyof;
+    dispatch[NDIGITA][ANYOF] = compare_ndigita_anyof;
+#else
+    dispatch[POSIXD][ANYOF] = compare_posix_anyof;
+    dispatch[POSIXU][ANYOF] = compare_posix_anyof;
+    dispatch[POSIXA][ANYOF] = compare_posix_anyof;
+    dispatch[NPOSIXD][ANYOF] = compare_negative_posix_anyof;
+    dispatch[NPOSIXU][ANYOF] = compare_negative_posix_anyof;
+    dispatch[NPOSIXA][ANYOF] = compare_negative_posix_anyof;
+#endif
     dispatch[BRANCH][ANYOF] = compare_left_branch;
     dispatch[EXACT][ANYOF] = compare_exact_anyof;
     dispatch[EXACTF][ANYOF] = compare_exactf_anyof;
@@ -3715,10 +4807,15 @@ void rc_init()
     dispatch[IFMATCH][ANYOF] = compare_after_assertion;
     dispatch[UNLESSM][ANYOF] = compare_after_assertion;
     dispatch[MINMOD][ANYOF] = compare_left_tail;
+#ifndef RC_POSIX_NODES
+    dispatch[VERTWS][ANYOF] = compare_vertical_space_anyof;
+    dispatch[NVERTWS][ANYOF] = compare_negative_vertical_space_anyof;
     dispatch[HORIZWS][ANYOF] = compare_horizontal_space_anyof;
     dispatch[NHORIZWS][ANYOF] = compare_negative_horizontal_space_anyof;
+#endif
     dispatch[OPTIMIZED][ANYOF] = compare_left_tail;
 
+#ifndef RC_POSIX_NODES
     dispatch[SUCCEED][ALNUM] = compare_left_tail;
     dispatch[BOL][ALNUM] = compare_bol;
     dispatch[MBOL][ALNUM] = compare_bol;
@@ -3729,11 +4826,17 @@ void rc_init()
     dispatch[SANY][ALNUM] = compare_mismatch;
     dispatch[ANYOF][ALNUM] = compare_anyof_alnum;
     dispatch[ALNUM][ALNUM] = compare_tails;
+    dispatch[ALNUMA][ALNUM] = compare_tails;
     dispatch[NALNUM][ALNUM] = compare_mismatch;
+    dispatch[NALNUMA][ALNUM] = compare_mismatch;
     dispatch[SPACE][ALNUM] = compare_mismatch;
+    dispatch[SPACEA][ALNUM] = compare_mismatch;
     dispatch[NSPACE][ALNUM] = compare_mismatch;
+    dispatch[NSPACEA][ALNUM] = compare_mismatch;
     dispatch[DIGIT][ALNUM] = compare_tails;
+    dispatch[DIGITA][ALNUM] = compare_tails;
     dispatch[NDIGIT][ALNUM] = compare_mismatch;
+    dispatch[NDIGITA][ALNUM] = compare_mismatch;
     dispatch[BRANCH][ALNUM] = compare_left_branch;
     dispatch[EXACT][ALNUM] = compare_exact_alnum;
     dispatch[EXACTF][ALNUM] = compare_exact_alnum;
@@ -3750,9 +4853,54 @@ void rc_init()
     dispatch[IFMATCH][ALNUM] = compare_after_assertion;
     dispatch[UNLESSM][ALNUM] = compare_after_assertion;
     dispatch[MINMOD][ALNUM] = compare_left_tail;
+    dispatch[VERTWS][ALNUM] = compare_mismatch;
+    dispatch[NVERTWS][ALNUM] = compare_mismatch;
     dispatch[HORIZWS][ALNUM] = compare_mismatch;
     dispatch[NHORIZWS][ALNUM] = compare_mismatch;
     dispatch[OPTIMIZED][ALNUM] = compare_left_tail;
+
+    dispatch[SUCCEED][ALNUMA] = compare_left_tail;
+    dispatch[BOL][ALNUMA] = compare_bol;
+    dispatch[MBOL][ALNUMA] = compare_bol;
+    dispatch[SBOL][ALNUMA] = compare_bol;
+    dispatch[BOUND][ALNUMA] = compare_mismatch;
+    dispatch[NBOUND][ALNUMA] = compare_mismatch;
+    dispatch[REG_ANY][ALNUMA] = compare_mismatch;
+    dispatch[SANY][ALNUMA] = compare_mismatch;
+    dispatch[ANYOF][ALNUMA] = compare_anyof_alnuma;
+    dispatch[ALNUM][ALNUMA] = compare_mismatch;
+    dispatch[ALNUMA][ALNUMA] = compare_tails;
+    dispatch[NALNUM][ALNUMA] = compare_mismatch;
+    dispatch[NALNUMA][ALNUMA] = compare_mismatch;
+    dispatch[SPACE][ALNUMA] = compare_mismatch;
+    dispatch[SPACEA][ALNUMA] = compare_mismatch;
+    dispatch[NSPACE][ALNUMA] = compare_mismatch;
+    dispatch[NSPACEA][ALNUMA] = compare_mismatch;
+    dispatch[DIGIT][ALNUMA] = compare_mismatch;
+    dispatch[DIGITA][ALNUMA] = compare_tails;
+    dispatch[NDIGIT][ALNUMA] = compare_mismatch;
+    dispatch[NDIGITA][ALNUMA] = compare_mismatch;
+    dispatch[BRANCH][ALNUMA] = compare_left_branch;
+    dispatch[EXACT][ALNUMA] = compare_exact_alnum;
+    dispatch[EXACTF][ALNUMA] = compare_exact_alnum;
+    dispatch[NOTHING][ALNUMA] = compare_left_tail;
+    dispatch[TAIL][ALNUMA] = compare_left_tail;
+    dispatch[STAR][ALNUMA] = compare_mismatch;
+    dispatch[PLUS][ALNUMA] = compare_left_plus;
+    dispatch[CURLY][ALNUMA] = compare_left_curly;
+    dispatch[CURLYM][ALNUMA] = compare_left_curly;
+    dispatch[CURLYX][ALNUMA] = compare_left_curly;
+    dispatch[WHILEM][ALNUMA] = compare_left_tail;
+    dispatch[OPEN][ALNUMA] = compare_left_open;
+    dispatch[CLOSE][ALNUMA] = compare_left_tail;
+    dispatch[IFMATCH][ALNUMA] = compare_after_assertion;
+    dispatch[UNLESSM][ALNUMA] = compare_after_assertion;
+    dispatch[MINMOD][ALNUMA] = compare_left_tail;
+    dispatch[VERTWS][ALNUMA] = compare_mismatch;
+    dispatch[NVERTWS][ALNUMA] = compare_mismatch;
+    dispatch[HORIZWS][ALNUMA] = compare_mismatch;
+    dispatch[NHORIZWS][ALNUMA] = compare_mismatch;
+    dispatch[OPTIMIZED][ALNUMA] = compare_left_tail;
 
     dispatch[SUCCEED][NALNUM] = compare_left_tail;
     dispatch[BOL][NALNUM] = compare_bol;
@@ -3764,11 +4912,17 @@ void rc_init()
     dispatch[SANY][NALNUM] = compare_mismatch;
     dispatch[ANYOF][NALNUM] = compare_anyof_nalnum;
     dispatch[ALNUM][NALNUM] = compare_mismatch;
+    dispatch[ALNUMA][NALNUM] = compare_mismatch;
     dispatch[NALNUM][NALNUM] = compare_tails;
+    dispatch[NALNUMA][NALNUM] = compare_mismatch;
     dispatch[SPACE][NALNUM] = compare_tails;
+    dispatch[SPACEA][NALNUM] = compare_tails;
     dispatch[NSPACE][NALNUM] = compare_mismatch;
+    dispatch[NSPACEA][NALNUM] = compare_mismatch;
     dispatch[DIGIT][NALNUM] = compare_mismatch;
+    dispatch[DIGITA][NALNUM] = compare_mismatch;
     dispatch[NDIGIT][NALNUM] = compare_mismatch;
+    dispatch[NDIGITA][NALNUM] = compare_mismatch;
     dispatch[BRANCH][NALNUM] = compare_left_branch;
     dispatch[EXACT][NALNUM] = compare_exact_nalnum;
     dispatch[EXACTF][NALNUM] = compare_exact_nalnum;
@@ -3785,9 +4939,54 @@ void rc_init()
     dispatch[IFMATCH][NALNUM] = compare_after_assertion;
     dispatch[UNLESSM][NALNUM] = compare_after_assertion;
     dispatch[MINMOD][NALNUM] = compare_left_tail;
+    dispatch[VERTWS][NALNUM] = compare_tails;
+    dispatch[NVERTWS][NALNUM] = compare_mismatch;
     dispatch[HORIZWS][NALNUM] = compare_tails;
     dispatch[NHORIZWS][NALNUM] = compare_mismatch;
     dispatch[OPTIMIZED][NALNUM] = compare_left_tail;
+
+    dispatch[SUCCEED][NALNUMA] = compare_left_tail;
+    dispatch[BOL][NALNUMA] = compare_bol;
+    dispatch[MBOL][NALNUMA] = compare_bol;
+    dispatch[SBOL][NALNUMA] = compare_bol;
+    dispatch[BOUND][NALNUMA] = compare_mismatch;
+    dispatch[NBOUND][NALNUMA] = compare_mismatch;
+    dispatch[REG_ANY][NALNUMA] = compare_mismatch;
+    dispatch[SANY][NALNUMA] = compare_mismatch;
+    dispatch[ANYOF][NALNUMA] = compare_anyof_nalnum;
+    dispatch[ALNUM][NALNUMA] = compare_mismatch;
+    dispatch[ALNUMA][NALNUMA] = compare_mismatch;
+    dispatch[NALNUM][NALNUMA] = compare_tails;
+    dispatch[NALNUMA][NALNUMA] = compare_tails;
+    dispatch[SPACE][NALNUMA] = compare_tails;
+    dispatch[SPACEA][NALNUMA] = compare_tails;
+    dispatch[NSPACE][NALNUMA] = compare_mismatch;
+    dispatch[NSPACEA][NALNUMA] = compare_mismatch;
+    dispatch[DIGIT][NALNUMA] = compare_mismatch;
+    dispatch[DIGITA][NALNUMA] = compare_mismatch;
+    dispatch[NDIGIT][NALNUMA] = compare_mismatch;
+    dispatch[NDIGITA][NALNUMA] = compare_mismatch;
+    dispatch[BRANCH][NALNUMA] = compare_left_branch;
+    dispatch[EXACT][NALNUMA] = compare_exact_nalnum;
+    dispatch[EXACTF][NALNUMA] = compare_exact_nalnum;
+    dispatch[NOTHING][NALNUMA] = compare_left_tail;
+    dispatch[TAIL][NALNUMA] = compare_left_tail;
+    dispatch[STAR][NALNUMA] = compare_mismatch;
+    dispatch[PLUS][NALNUMA] = compare_left_plus;
+    dispatch[CURLY][NALNUMA] = compare_left_curly;
+    dispatch[CURLYM][NALNUMA] = compare_left_curly;
+    dispatch[CURLYX][NALNUMA] = compare_left_curly;
+    dispatch[WHILEM][NALNUMA] = compare_left_tail;
+    dispatch[OPEN][NALNUMA] = compare_left_open;
+    dispatch[CLOSE][NALNUMA] = compare_left_tail;
+    dispatch[IFMATCH][NALNUMA] = compare_after_assertion;
+    dispatch[UNLESSM][NALNUMA] = compare_after_assertion;
+    dispatch[MINMOD][NALNUMA] = compare_left_tail;
+    dispatch[VERTWS][NALNUMA] = compare_tails;
+    dispatch[NVERTWS][NALNUMA] = compare_mismatch;
+    dispatch[HORIZWS][NALNUMA] = compare_tails;
+    dispatch[NHORIZWS][NALNUMA] = compare_mismatch;
+    dispatch[OPTIMIZED][NALNUMA] = compare_left_tail;
 
     dispatch[SUCCEED][SPACE] = compare_left_tail;
     dispatch[BOL][SPACE] = compare_bol;
@@ -3799,11 +4998,17 @@ void rc_init()
     dispatch[SANY][SPACE] = compare_mismatch;
     dispatch[ANYOF][SPACE] = compare_anyof_space;
     dispatch[ALNUM][SPACE] = compare_mismatch;
+    dispatch[ALNUMA][SPACE] = compare_mismatch;
     dispatch[NALNUM][SPACE] = compare_mismatch;
+    dispatch[NALNUMA][SPACE] = compare_mismatch;
     dispatch[SPACE][SPACE] = compare_tails;
+    dispatch[SPACEA][SPACE] = compare_tails;
     dispatch[NSPACE][SPACE] = compare_mismatch;
+    dispatch[NSPACEA][SPACE] = compare_mismatch;
     dispatch[DIGIT][SPACE] = compare_mismatch;
+    dispatch[DIGITA][SPACE] = compare_mismatch;
     dispatch[NDIGIT][SPACE] = compare_mismatch;
+    dispatch[NDIGITA][SPACE] = compare_mismatch;
     dispatch[BRANCH][SPACE] = compare_left_branch;
     dispatch[EXACT][SPACE] = compare_exact_space;
     dispatch[EXACTF][SPACE] = compare_exact_space;
@@ -3820,9 +5025,54 @@ void rc_init()
     dispatch[IFMATCH][SPACE] = compare_after_assertion;
     dispatch[UNLESSM][SPACE] = compare_after_assertion;
     dispatch[MINMOD][SPACE] = compare_left_tail;
+    dispatch[VERTWS][SPACE] = compare_mismatch;
+    dispatch[NVERTWS][SPACE] = compare_mismatch;
     dispatch[HORIZWS][SPACE] = compare_tails;
     dispatch[NHORIZWS][SPACE] = compare_mismatch;
     dispatch[OPTIMIZED][SPACE] = compare_left_tail;
+
+    dispatch[SUCCEED][SPACEA] = compare_left_tail;
+    dispatch[BOL][SPACEA] = compare_bol;
+    dispatch[MBOL][SPACEA] = compare_bol;
+    dispatch[SBOL][SPACEA] = compare_bol;
+    dispatch[BOUND][SPACEA] = compare_mismatch;
+    dispatch[NBOUND][SPACEA] = compare_mismatch;
+    dispatch[REG_ANY][SPACEA] = compare_mismatch;
+    dispatch[SANY][SPACEA] = compare_mismatch;
+    dispatch[ANYOF][SPACEA] = compare_anyof_spacea;
+    dispatch[ALNUM][SPACEA] = compare_mismatch;
+    dispatch[ALNUMA][SPACEA] = compare_mismatch;
+    dispatch[NALNUM][SPACEA] = compare_mismatch;
+    dispatch[NALNUMA][SPACEA] = compare_mismatch;
+    dispatch[SPACE][SPACEA] = compare_mismatch;
+    dispatch[SPACEA][SPACEA] = compare_tails;
+    dispatch[NSPACE][SPACEA] = compare_mismatch;
+    dispatch[NSPACEA][SPACEA] = compare_mismatch;
+    dispatch[DIGIT][SPACEA] = compare_mismatch;
+    dispatch[DIGITA][SPACEA] = compare_mismatch;
+    dispatch[NDIGIT][SPACEA] = compare_mismatch;
+    dispatch[NDIGITA][SPACEA] = compare_mismatch;
+    dispatch[BRANCH][SPACEA] = compare_left_branch;
+    dispatch[EXACT][SPACEA] = compare_exact_space;
+    dispatch[EXACTF][SPACEA] = compare_exact_space;
+    dispatch[NOTHING][SPACEA] = compare_left_tail;
+    dispatch[TAIL][SPACEA] = compare_left_tail;
+    dispatch[STAR][SPACEA] = compare_mismatch;
+    dispatch[PLUS][SPACEA] = compare_left_plus;
+    dispatch[CURLY][SPACEA] = compare_left_curly;
+    dispatch[CURLYM][SPACEA] = compare_left_curly;
+    dispatch[CURLYX][SPACEA] = compare_left_curly;
+    dispatch[WHILEM][SPACEA] = compare_left_tail;
+    dispatch[OPEN][SPACEA] = compare_left_open;
+    dispatch[CLOSE][SPACEA] = compare_left_tail;
+    dispatch[IFMATCH][SPACEA] = compare_after_assertion;
+    dispatch[UNLESSM][SPACEA] = compare_after_assertion;
+    dispatch[MINMOD][SPACEA] = compare_left_tail;
+    dispatch[VERTWS][SPACEA] = compare_mismatch;
+    dispatch[NVERTWS][SPACEA] = compare_mismatch;
+    dispatch[HORIZWS][SPACEA] = compare_mismatch;
+    dispatch[NHORIZWS][SPACEA] = compare_mismatch;
+    dispatch[OPTIMIZED][SPACEA] = compare_left_tail;
 
     dispatch[SUCCEED][NSPACE] = compare_left_tail;
     dispatch[BOL][NSPACE] = compare_bol;
@@ -3834,11 +5084,17 @@ void rc_init()
     dispatch[SANY][NSPACE] = compare_mismatch;
     dispatch[ANYOF][NSPACE] = compare_anyof_nspace;
     dispatch[ALNUM][NSPACE] = compare_tails;
+    dispatch[ALNUMA][NSPACE] = compare_tails;
     dispatch[NALNUM][NSPACE] = compare_mismatch;
+    dispatch[NALNUMA][NSPACE] = compare_mismatch;
     dispatch[SPACE][NSPACE] = compare_mismatch;
+    dispatch[SPACEA][NSPACE] = compare_mismatch;
     dispatch[NSPACE][NSPACE] = compare_tails;
+    dispatch[NSPACEA][NSPACE] = compare_tails;
     dispatch[DIGIT][NSPACE] = compare_tails;
+    dispatch[DIGITA][NSPACE] = compare_tails;
     dispatch[NDIGIT][NSPACE] = compare_mismatch;
+    dispatch[NDIGITA][NSPACE] = compare_mismatch;
     dispatch[BRANCH][NSPACE] = compare_left_branch;
     dispatch[EXACT][NSPACE] = compare_exact_nspace;
     dispatch[EXACTF][NSPACE] = compare_exact_nspace;
@@ -3855,9 +5111,54 @@ void rc_init()
     dispatch[IFMATCH][NSPACE] = compare_after_assertion;
     dispatch[UNLESSM][NSPACE] = compare_after_assertion;
     dispatch[MINMOD][NSPACE] = compare_left_tail;
+    dispatch[VERTWS][NSPACE] = compare_mismatch;
+    dispatch[NVERTWS][NSPACE] = compare_mismatch;
     dispatch[HORIZWS][NSPACE] = compare_mismatch;
     dispatch[NHORIZWS][NSPACE] = compare_mismatch;
     dispatch[OPTIMIZED][NSPACE] = compare_left_tail;
+
+    dispatch[SUCCEED][NSPACEA] = compare_left_tail;
+    dispatch[BOL][NSPACEA] = compare_bol;
+    dispatch[MBOL][NSPACEA] = compare_bol;
+    dispatch[SBOL][NSPACEA] = compare_bol;
+    dispatch[BOUND][NSPACEA] = compare_mismatch;
+    dispatch[NBOUND][NSPACEA] = compare_mismatch;
+    dispatch[REG_ANY][NSPACEA] = compare_mismatch;
+    dispatch[SANY][NSPACEA] = compare_mismatch;
+    dispatch[ANYOF][NSPACEA] = compare_anyof_nspace;
+    dispatch[ALNUM][NSPACEA] = compare_mismatch;
+    dispatch[ALNUMA][NSPACEA] = compare_tails;
+    dispatch[NALNUM][NSPACEA] = compare_mismatch;
+    dispatch[NALNUMA][NSPACEA] = compare_mismatch;
+    dispatch[SPACE][NSPACEA] = compare_mismatch;
+    dispatch[SPACEA][NSPACEA] = compare_mismatch;
+    dispatch[NSPACE][NSPACEA] = compare_mismatch;
+    dispatch[NSPACEA][NSPACEA] = compare_tails;
+    dispatch[DIGIT][NSPACEA] = compare_mismatch;
+    dispatch[DIGITA][NSPACEA] = compare_tails;
+    dispatch[NDIGIT][NSPACEA] = compare_mismatch;
+    dispatch[NDIGITA][NSPACEA] = compare_mismatch;
+    dispatch[BRANCH][NSPACEA] = compare_left_branch;
+    dispatch[EXACT][NSPACEA] = compare_exact_nspace;
+    dispatch[EXACTF][NSPACEA] = compare_exact_nspace;
+    dispatch[NOTHING][NSPACEA] = compare_left_tail;
+    dispatch[TAIL][NSPACEA] = compare_left_tail;
+    dispatch[STAR][NSPACEA] = compare_mismatch;
+    dispatch[PLUS][NSPACEA] = compare_left_plus;
+    dispatch[CURLY][NSPACEA] = compare_left_curly;
+    dispatch[CURLYM][NSPACEA] = compare_left_curly;
+    dispatch[CURLYX][NSPACEA] = compare_left_curly;
+    dispatch[WHILEM][NSPACEA] = compare_left_tail;
+    dispatch[OPEN][NSPACEA] = compare_left_open;
+    dispatch[CLOSE][NSPACEA] = compare_left_tail;
+    dispatch[IFMATCH][NSPACEA] = compare_after_assertion;
+    dispatch[UNLESSM][NSPACEA] = compare_after_assertion;
+    dispatch[MINMOD][NSPACEA] = compare_left_tail;
+    dispatch[VERTWS][NSPACEA] = compare_mismatch;
+    dispatch[NVERTWS][NSPACEA] = compare_mismatch;
+    dispatch[HORIZWS][NSPACEA] = compare_mismatch;
+    dispatch[NHORIZWS][NSPACEA] = compare_mismatch;
+    dispatch[OPTIMIZED][NSPACEA] = compare_left_tail;
 
     dispatch[SUCCEED][DIGIT] = compare_left_tail;
     dispatch[BOL][DIGIT] = compare_bol;
@@ -3869,11 +5170,17 @@ void rc_init()
     dispatch[SANY][DIGIT] = compare_mismatch;
     dispatch[ANYOF][DIGIT] = compare_anyof_digit;
     dispatch[ALNUM][DIGIT] = compare_mismatch;
+    dispatch[ALNUMA][DIGIT] = compare_mismatch;
     dispatch[NALNUM][DIGIT] = compare_mismatch;
+    dispatch[NALNUMA][DIGIT] = compare_mismatch;
     dispatch[SPACE][DIGIT] = compare_mismatch;
+    dispatch[SPACEA][DIGIT] = compare_mismatch;
     dispatch[NSPACE][DIGIT] = compare_mismatch;
+    dispatch[NSPACEA][DIGIT] = compare_mismatch;
     dispatch[DIGIT][DIGIT] = compare_tails;
+    dispatch[DIGITA][DIGIT] = compare_tails;
     dispatch[NDIGIT][DIGIT] = compare_mismatch;
+    dispatch[NDIGITA][DIGIT] = compare_mismatch;
     dispatch[BRANCH][DIGIT] = compare_left_branch;
     dispatch[EXACT][DIGIT] = compare_exact_digit;
     dispatch[EXACTF][DIGIT] = compare_exact_digit;
@@ -3890,9 +5197,54 @@ void rc_init()
     dispatch[IFMATCH][DIGIT] = compare_after_assertion;
     dispatch[UNLESSM][DIGIT] = compare_after_assertion;
     dispatch[MINMOD][DIGIT] = compare_left_tail;
+    dispatch[VERTWS][DIGIT] = compare_mismatch;
+    dispatch[NVERTWS][DIGIT] = compare_mismatch;
     dispatch[HORIZWS][DIGIT] = compare_mismatch;
     dispatch[NHORIZWS][DIGIT] = compare_mismatch;
     dispatch[OPTIMIZED][DIGIT] = compare_left_tail;
+
+    dispatch[SUCCEED][DIGITA] = compare_left_tail;
+    dispatch[BOL][DIGITA] = compare_bol;
+    dispatch[MBOL][DIGITA] = compare_bol;
+    dispatch[SBOL][DIGITA] = compare_bol;
+    dispatch[BOUND][DIGITA] = compare_mismatch;
+    dispatch[NBOUND][DIGITA] = compare_mismatch;
+    dispatch[REG_ANY][DIGITA] = compare_mismatch;
+    dispatch[SANY][DIGITA] = compare_mismatch;
+    dispatch[ANYOF][DIGITA] = compare_anyof_digita;
+    dispatch[ALNUM][DIGITA] = compare_mismatch;
+    dispatch[ALNUMA][DIGITA] = compare_mismatch;
+    dispatch[NALNUM][DIGITA] = compare_mismatch;
+    dispatch[NALNUMA][DIGITA] = compare_mismatch;
+    dispatch[SPACE][DIGITA] = compare_mismatch;
+    dispatch[SPACEA][DIGITA] = compare_mismatch;
+    dispatch[NSPACE][DIGITA] = compare_mismatch;
+    dispatch[NSPACEA][DIGITA] = compare_mismatch;
+    dispatch[DIGIT][DIGITA] = compare_mismatch;
+    dispatch[DIGITA][DIGITA] = compare_tails;
+    dispatch[NDIGIT][DIGITA] = compare_mismatch;
+    dispatch[NDIGITA][DIGITA] = compare_mismatch;
+    dispatch[BRANCH][DIGITA] = compare_left_branch;
+    dispatch[EXACT][DIGITA] = compare_exact_digit;
+    dispatch[EXACTF][DIGITA] = compare_exact_digit;
+    dispatch[NOTHING][DIGITA] = compare_left_tail;
+    dispatch[TAIL][DIGITA] = compare_left_tail;
+    dispatch[STAR][DIGITA] = compare_mismatch;
+    dispatch[PLUS][DIGITA] = compare_left_plus;
+    dispatch[CURLY][DIGITA] = compare_left_curly;
+    dispatch[CURLYM][DIGITA] = compare_left_curly;
+    dispatch[CURLYX][DIGITA] = compare_left_curly;
+    dispatch[WHILEM][DIGITA] = compare_left_tail;
+    dispatch[OPEN][DIGITA] = compare_left_open;
+    dispatch[CLOSE][DIGITA] = compare_left_tail;
+    dispatch[IFMATCH][DIGITA] = compare_after_assertion;
+    dispatch[UNLESSM][DIGITA] = compare_after_assertion;
+    dispatch[MINMOD][DIGITA] = compare_left_tail;
+    dispatch[VERTWS][DIGITA] = compare_mismatch;
+    dispatch[NVERTWS][DIGITA] = compare_mismatch;
+    dispatch[HORIZWS][DIGITA] = compare_mismatch;
+    dispatch[NHORIZWS][DIGITA] = compare_mismatch;
+    dispatch[OPTIMIZED][DIGITA] = compare_left_tail;
 
     dispatch[SUCCEED][NDIGIT] = compare_left_tail;
     dispatch[BOL][NDIGIT] = compare_bol;
@@ -3904,11 +5256,17 @@ void rc_init()
     dispatch[SANY][NDIGIT] = compare_mismatch;
     dispatch[ANYOF][NDIGIT] = compare_anyof_ndigit;
     dispatch[ALNUM][NDIGIT] = compare_mismatch;
+    dispatch[ALNUMA][NDIGIT] = compare_mismatch;
     dispatch[NALNUM][NDIGIT] = compare_tails;
+    dispatch[NALNUMA][NDIGIT] = compare_mismatch;
     dispatch[SPACE][NDIGIT] = compare_tails;
+    dispatch[SPACEA][NDIGIT] = compare_tails;
     dispatch[NSPACE][NDIGIT] = compare_mismatch;
+    dispatch[NSPACEA][NDIGIT] = compare_mismatch;
     dispatch[DIGIT][NDIGIT] = compare_mismatch;
+    dispatch[DIGITA][NDIGIT] = compare_mismatch;
     dispatch[NDIGIT][NDIGIT] = compare_tails;
+    dispatch[NDIGITA][NDIGIT] = compare_mismatch;
     dispatch[BRANCH][NDIGIT] = compare_left_branch;
     dispatch[EXACT][NDIGIT] = compare_exact_ndigit;
     dispatch[EXACTF][NDIGIT] = compare_exact_ndigit;
@@ -3925,11 +5283,239 @@ void rc_init()
     dispatch[IFMATCH][NDIGIT] = compare_after_assertion;
     dispatch[UNLESSM][NDIGIT] = compare_after_assertion;
     dispatch[MINMOD][NDIGIT] = compare_left_tail;
+    dispatch[VERTWS][NDIGIT] = compare_tails;
+    dispatch[NVERTWS][NDIGIT] = compare_mismatch;
     dispatch[HORIZWS][NDIGIT] = compare_tails;
     dispatch[NHORIZWS][NDIGIT] = compare_mismatch;
     dispatch[OPTIMIZED][NDIGIT] = compare_left_tail;
 
-    for (i = 0; i < TYPE_COUNT; ++i)
+    dispatch[SUCCEED][NDIGITA] = compare_left_tail;
+    dispatch[BOL][NDIGITA] = compare_bol;
+    dispatch[MBOL][NDIGITA] = compare_bol;
+    dispatch[SBOL][NDIGITA] = compare_bol;
+    dispatch[BOUND][NDIGITA] = compare_mismatch;
+    dispatch[NBOUND][NDIGITA] = compare_mismatch;
+    dispatch[REG_ANY][NDIGITA] = compare_mismatch;
+    dispatch[SANY][NDIGITA] = compare_mismatch;
+    dispatch[ANYOF][NDIGITA] = compare_anyof_ndigit;
+    dispatch[ALNUM][NDIGITA] = compare_mismatch;
+    dispatch[ALNUMA][NDIGITA] = compare_mismatch;
+    dispatch[NALNUM][NDIGITA] = compare_mismatch; /* conservative */
+    dispatch[NALNUMA][NDIGITA] = compare_tails;
+    dispatch[SPACE][NDIGITA] = compare_tails;
+    dispatch[SPACEA][NDIGITA] = compare_tails;
+    dispatch[NSPACE][NDIGITA] = compare_mismatch;
+    dispatch[NSPACEA][NDIGITA] = compare_mismatch;
+    dispatch[DIGIT][NDIGITA] = compare_mismatch;
+    dispatch[DIGITA][NDIGITA] = compare_mismatch;
+    dispatch[NDIGIT][NDIGITA] = compare_mismatch;
+    dispatch[NDIGITA][NDIGITA] = compare_tails;
+    dispatch[BRANCH][NDIGITA] = compare_left_branch;
+    dispatch[EXACT][NDIGITA] = compare_exact_ndigit;
+    dispatch[EXACTF][NDIGITA] = compare_exact_ndigit;
+    dispatch[NOTHING][NDIGITA] = compare_left_tail;
+    dispatch[TAIL][NDIGITA] = compare_left_tail;
+    dispatch[STAR][NDIGITA] = compare_mismatch;
+    dispatch[PLUS][NDIGITA] = compare_left_plus;
+    dispatch[CURLY][NDIGITA] = compare_left_curly;
+    dispatch[CURLYM][NDIGITA] = compare_left_curly;
+    dispatch[CURLYX][NDIGITA] = compare_left_curly;
+    dispatch[WHILEM][NDIGITA] = compare_left_tail;
+    dispatch[OPEN][NDIGITA] = compare_left_open;
+    dispatch[CLOSE][NDIGITA] = compare_left_tail;
+    dispatch[IFMATCH][NDIGITA] = compare_after_assertion;
+    dispatch[UNLESSM][NDIGITA] = compare_after_assertion;
+    dispatch[MINMOD][NDIGITA] = compare_left_tail;
+    dispatch[VERTWS][NDIGITA] = compare_tails;
+    dispatch[NVERTWS][NDIGITA] = compare_mismatch;
+    dispatch[HORIZWS][NDIGITA] = compare_tails;
+    dispatch[NHORIZWS][NDIGITA] = compare_mismatch;
+    dispatch[OPTIMIZED][NDIGITA] = compare_left_tail;
+#else
+    dispatch[SUCCEED][POSIXD] = compare_left_tail;
+    dispatch[BOL][POSIXD] = compare_bol;
+    dispatch[MBOL][POSIXD] = compare_bol;
+    dispatch[SBOL][POSIXD] = compare_bol;
+    dispatch[BOUND][POSIXD] = compare_mismatch;
+    dispatch[NBOUND][POSIXD] = compare_mismatch;
+    dispatch[REG_ANY][POSIXD] = compare_mismatch;
+    dispatch[SANY][POSIXD] = compare_mismatch;
+    dispatch[ANYOF][POSIXD] = compare_anyof_posix;
+    dispatch[POSIXD][POSIXD] = compare_posix_posix;
+    dispatch[POSIXU][POSIXD] = compare_posix_posix;
+    dispatch[POSIXA][POSIXD] = compare_posix_posix;
+    dispatch[NPOSIXD][POSIXD] = compare_mismatch;
+    dispatch[NPOSIXU][POSIXD] = compare_mismatch;
+    dispatch[NPOSIXA][POSIXD] = compare_mismatch;
+    dispatch[BRANCH][POSIXD] = compare_left_branch;
+    dispatch[EXACT][POSIXD] = compare_exact_posix;
+    dispatch[EXACTF][POSIXD] = compare_exactf_posix;
+    dispatch[NOTHING][POSIXD] = compare_left_tail;
+    dispatch[STAR][POSIXD] = compare_mismatch;
+    dispatch[PLUS][POSIXD] = compare_left_plus;
+    dispatch[CURLY][POSIXD] = compare_left_curly;
+    dispatch[CURLYM][POSIXD] = compare_left_curly;
+    dispatch[CURLYX][POSIXD] = compare_left_curly;
+    dispatch[OPEN][POSIXD] = compare_left_open;
+    dispatch[CLOSE][POSIXD] = compare_left_tail;
+    dispatch[IFMATCH][POSIXD] = compare_after_assertion;
+    dispatch[UNLESSM][POSIXD] = compare_after_assertion;
+    dispatch[MINMOD][POSIXD] = compare_left_tail;
+    dispatch[OPTIMIZED][POSIXD] = compare_left_tail;
+
+    dispatch[SUCCEED][POSIXU] = compare_left_tail;
+    dispatch[BOL][POSIXU] = compare_bol;
+    dispatch[MBOL][POSIXU] = compare_bol;
+    dispatch[SBOL][POSIXU] = compare_bol;
+    dispatch[BOUND][POSIXU] = compare_mismatch;
+    dispatch[NBOUND][POSIXU] = compare_mismatch;
+    dispatch[REG_ANY][POSIXU] = compare_mismatch;
+    dispatch[SANY][POSIXU] = compare_mismatch;
+    dispatch[POSIXD][POSIXU] = compare_posix_posix;
+    dispatch[POSIXU][POSIXU] = compare_posix_posix;
+    dispatch[NPOSIXU][POSIXU] = compare_mismatch;
+    dispatch[BRANCH][POSIXU] = compare_left_branch;
+    dispatch[EXACT][POSIXU] = compare_exact_posix;
+    dispatch[EXACTF][POSIXU] = compare_exact_posix;
+    dispatch[NOTHING][POSIXU] = compare_left_tail;
+    dispatch[STAR][POSIXU] = compare_mismatch;
+    dispatch[PLUS][POSIXU] = compare_left_plus;
+    dispatch[CURLY][POSIXU] = compare_left_curly;
+    dispatch[CURLYM][POSIXU] = compare_left_curly;
+    dispatch[CURLYX][POSIXU] = compare_left_curly;
+    dispatch[OPEN][POSIXU] = compare_left_open;
+    dispatch[CLOSE][POSIXU] = compare_left_tail;
+    dispatch[IFMATCH][POSIXU] = compare_after_assertion;
+    dispatch[UNLESSM][POSIXU] = compare_after_assertion;
+    dispatch[MINMOD][POSIXU] = compare_left_tail;
+    dispatch[OPTIMIZED][POSIXU] = compare_left_tail;
+
+    dispatch[SUCCEED][POSIXA] = compare_left_tail;
+    dispatch[BOL][POSIXA] = compare_bol;
+    dispatch[MBOL][POSIXA] = compare_bol;
+    dispatch[SBOL][POSIXA] = compare_bol;
+    dispatch[BOUND][POSIXA] = compare_mismatch;
+    dispatch[NBOUND][POSIXA] = compare_mismatch;
+    dispatch[REG_ANY][POSIXA] = compare_mismatch;
+    dispatch[SANY][POSIXA] = compare_mismatch;
+    dispatch[ANYOF][POSIXA] = compare_anyof_posixa;
+    dispatch[POSIXD][POSIXA] = compare_mismatch;
+    dispatch[POSIXU][POSIXA] = compare_mismatch;
+    dispatch[POSIXA][POSIXA] = compare_posix_posix;
+    dispatch[NPOSIXD][POSIXA] = compare_mismatch;
+    dispatch[NPOSIXU][POSIXA] = compare_mismatch;
+    dispatch[NPOSIXA][POSIXA] = compare_mismatch;
+    dispatch[BRANCH][POSIXA] = compare_left_branch;
+    dispatch[EXACT][POSIXA] = compare_exact_posix;
+    dispatch[EXACTF][POSIXA] = compare_exact_posix;
+    dispatch[NOTHING][POSIXA] = compare_left_tail;
+    dispatch[STAR][POSIXA] = compare_mismatch;
+    dispatch[PLUS][POSIXA] = compare_left_plus;
+    dispatch[CURLY][POSIXA] = compare_left_curly;
+    dispatch[CURLYM][POSIXA] = compare_left_curly;
+    dispatch[CURLYX][POSIXA] = compare_left_curly;
+    dispatch[OPEN][POSIXA] = compare_left_open;
+    dispatch[CLOSE][POSIXA] = compare_left_tail;
+    dispatch[IFMATCH][POSIXA] = compare_after_assertion;
+    dispatch[UNLESSM][POSIXA] = compare_after_assertion;
+    dispatch[MINMOD][POSIXA] = compare_left_tail;
+    dispatch[OPTIMIZED][POSIXA] = compare_left_tail;
+
+    dispatch[SUCCEED][NPOSIXD] = compare_left_tail;
+    dispatch[BOL][NPOSIXD] = compare_bol;
+    dispatch[MBOL][NPOSIXD] = compare_bol;
+    dispatch[SBOL][NPOSIXD] = compare_bol;
+    dispatch[BOUND][NPOSIXD] = compare_mismatch;
+    dispatch[NBOUND][NPOSIXD] = compare_mismatch;
+    dispatch[REG_ANY][NPOSIXD] = compare_mismatch;
+    dispatch[SANY][NPOSIXD] = compare_mismatch;
+    dispatch[ANYOF][NPOSIXD] = compare_anyof_negative_posix;
+    dispatch[POSIXD][NPOSIXD] = compare_posix_negative_posix;
+    dispatch[POSIXU][NPOSIXD] = compare_posix_negative_posix;
+    dispatch[POSIXA][NPOSIXD] = compare_posix_negative_posix;
+    dispatch[NPOSIXD][NPOSIXD] = compare_negative_posix_negative_posix;
+    dispatch[NPOSIXU][NPOSIXD] = compare_negative_posix_negative_posix;
+    dispatch[NPOSIXA][NPOSIXD] = compare_mismatch;
+    dispatch[BRANCH][NPOSIXD] = compare_left_branch;
+    dispatch[EXACT][NPOSIXD] = compare_exact_negative_posix;
+    dispatch[EXACTF][NPOSIXD] = compare_exactf_negative_posix;
+    dispatch[NOTHING][NPOSIXD] = compare_left_tail;
+    dispatch[STAR][NPOSIXD] = compare_mismatch;
+    dispatch[PLUS][NPOSIXD] = compare_left_plus;
+    dispatch[CURLY][NPOSIXD] = compare_left_curly;
+    dispatch[CURLYM][NPOSIXD] = compare_left_curly;
+    dispatch[CURLYX][NPOSIXD] = compare_left_curly;
+    dispatch[OPEN][NPOSIXD] = compare_left_open;
+    dispatch[CLOSE][NPOSIXD] = compare_left_tail;
+    dispatch[IFMATCH][NPOSIXD] = compare_after_assertion;
+    dispatch[UNLESSM][NPOSIXD] = compare_after_assertion;
+    dispatch[MINMOD][NPOSIXD] = compare_left_tail;
+    dispatch[OPTIMIZED][NPOSIXD] = compare_left_tail;
+
+    dispatch[SUCCEED][NPOSIXU] = compare_left_tail;
+    dispatch[BOL][NPOSIXU] = compare_bol;
+    dispatch[MBOL][NPOSIXU] = compare_bol;
+    dispatch[SBOL][NPOSIXU] = compare_bol;
+    dispatch[BOUND][NPOSIXU] = compare_mismatch;
+    dispatch[NBOUND][NPOSIXU] = compare_mismatch;
+    dispatch[REG_ANY][NPOSIXU] = compare_mismatch;
+    dispatch[SANY][NPOSIXU] = compare_mismatch;
+    dispatch[ANYOF][NPOSIXU] = compare_anyof_negative_posix;
+    dispatch[POSIXD][NPOSIXU] = compare_posix_negative_posix;
+    dispatch[POSIXU][NPOSIXU] = compare_posix_negative_posix;
+    dispatch[POSIXA][NPOSIXU] = compare_posix_negative_posix;
+    dispatch[NPOSIXD][NPOSIXU] = compare_negative_posix_negative_posix;
+    dispatch[NPOSIXU][NPOSIXU] = compare_negative_posix_negative_posix;
+    dispatch[NPOSIXA][NPOSIXU] = compare_mismatch;
+    dispatch[BRANCH][NPOSIXU] = compare_left_branch;
+    dispatch[EXACT][NPOSIXU] = compare_exact_negative_posix;
+    dispatch[EXACTF][NPOSIXU] = compare_exactf_negative_posix;
+    dispatch[NOTHING][NPOSIXU] = compare_left_tail;
+    dispatch[STAR][NPOSIXU] = compare_mismatch;
+    dispatch[PLUS][NPOSIXU] = compare_left_plus;
+    dispatch[CURLY][NPOSIXU] = compare_left_curly;
+    dispatch[CURLYM][NPOSIXU] = compare_left_curly;
+    dispatch[CURLYX][NPOSIXU] = compare_left_curly;
+    dispatch[OPEN][NPOSIXU] = compare_left_open;
+    dispatch[CLOSE][NPOSIXU] = compare_left_tail;
+    dispatch[IFMATCH][NPOSIXU] = compare_after_assertion;
+    dispatch[UNLESSM][NPOSIXU] = compare_after_assertion;
+    dispatch[MINMOD][NPOSIXU] = compare_left_tail;
+    dispatch[OPTIMIZED][NPOSIXU] = compare_left_tail;
+
+    dispatch[SUCCEED][NPOSIXA] = compare_left_tail;
+    dispatch[BOL][NPOSIXA] = compare_bol;
+    dispatch[MBOL][NPOSIXA] = compare_bol;
+    dispatch[SBOL][NPOSIXA] = compare_bol;
+    dispatch[BOUND][NPOSIXA] = compare_mismatch;
+    dispatch[NBOUND][NPOSIXA] = compare_mismatch;
+    dispatch[REG_ANY][NPOSIXA] = compare_mismatch;
+    dispatch[SANY][NPOSIXA] = compare_mismatch;
+    dispatch[ANYOF][NPOSIXA] = compare_anyof_negative_posix;
+    dispatch[POSIXD][NPOSIXA] = compare_posix_negative_posix;
+    dispatch[POSIXU][NPOSIXA] = compare_posix_negative_posix;
+    dispatch[POSIXA][NPOSIXA] = compare_posix_negative_posix;
+    dispatch[NPOSIXD][NPOSIXA] = compare_negative_posix_negative_posix;
+    dispatch[NPOSIXU][NPOSIXA] = compare_negative_posix_negative_posix;
+    dispatch[NPOSIXA][NPOSIXA] = compare_negative_posix_negative_posix;
+    dispatch[BRANCH][NPOSIXA] = compare_left_branch;
+    dispatch[EXACT][NPOSIXA] = compare_exact_negative_posix;
+    dispatch[EXACTF][NPOSIXA] = compare_exactf_negative_posix;
+    dispatch[NOTHING][NPOSIXA] = compare_left_tail;
+    dispatch[STAR][NPOSIXA] = compare_mismatch;
+    dispatch[PLUS][NPOSIXA] = compare_left_plus;
+    dispatch[CURLY][NPOSIXA] = compare_left_curly;
+    dispatch[CURLYM][NPOSIXA] = compare_left_curly;
+    dispatch[CURLYX][NPOSIXA] = compare_left_curly;
+    dispatch[OPEN][NPOSIXA] = compare_left_open;
+    dispatch[CLOSE][NPOSIXA] = compare_left_tail;
+    dispatch[IFMATCH][NPOSIXA] = compare_after_assertion;
+    dispatch[UNLESSM][NPOSIXA] = compare_after_assertion;
+    dispatch[MINMOD][NPOSIXA] = compare_left_tail;
+    dispatch[OPTIMIZED][NPOSIXA] = compare_left_tail;
+#endif
+
+    for (i = 0; i < REGNODE_MAX; ++i)
     {
 	dispatch[i][BRANCH] = compare_right_branch;
     }
@@ -3956,12 +5542,27 @@ void rc_init()
     dispatch[REG_ANY][EXACT] = compare_mismatch;
     dispatch[SANY][EXACT] = compare_mismatch;
     dispatch[ANYOF][EXACT] = compare_anyof_exact;
+#ifndef RC_POSIX_NODES
     dispatch[ALNUM][EXACT] = compare_mismatch;
+    dispatch[ALNUMA][EXACT] = compare_mismatch;
     dispatch[NALNUM][EXACT] = compare_mismatch;
+    dispatch[NALNUMA][EXACT] = compare_mismatch;
     dispatch[SPACE][EXACT] = compare_mismatch;
+    dispatch[SPACEA][EXACT] = compare_mismatch;
     dispatch[NSPACE][EXACT] = compare_mismatch;
+    dispatch[NSPACEA][EXACT] = compare_mismatch;
     dispatch[DIGIT][EXACT] = compare_mismatch;
+    dispatch[DIGITA][EXACT] = compare_mismatch;
     dispatch[NDIGIT][EXACT] = compare_mismatch;
+    dispatch[NDIGITA][EXACT] = compare_mismatch;
+#else
+    dispatch[POSIXD][EXACT] = compare_mismatch;
+    dispatch[POSIXU][EXACT] = compare_mismatch;
+    dispatch[POSIXA][EXACT] = compare_mismatch;
+    dispatch[NPOSIXD][EXACT] = compare_mismatch;
+    dispatch[NPOSIXU][EXACT] = compare_mismatch;
+    dispatch[NPOSIXA][EXACT] = compare_mismatch;
+#endif
     dispatch[BRANCH][EXACT] = compare_left_branch;
     dispatch[EXACT][EXACT] = compare_exact_exact;
     dispatch[EXACTF][EXACT] = compare_exactf_exact;
@@ -3978,8 +5579,12 @@ void rc_init()
     dispatch[IFMATCH][EXACT] = compare_after_assertion;
     dispatch[UNLESSM][EXACT] = compare_after_assertion;
     dispatch[MINMOD][EXACT] = compare_left_tail;
+#ifndef RC_POSIX_NODES
+    dispatch[VERTWS][EXACT] = compare_mismatch;
+    dispatch[NVERTWS][EXACT] = compare_mismatch;
     dispatch[HORIZWS][EXACT] = compare_mismatch;
     dispatch[NHORIZWS][EXACT] = compare_mismatch;
+#endif
     dispatch[OPTIMIZED][EXACT] = compare_left_tail;
 
     dispatch[SUCCEED][EXACTF] = compare_left_tail;
@@ -3991,12 +5596,27 @@ void rc_init()
     dispatch[REG_ANY][EXACTF] = compare_mismatch;
     dispatch[SANY][EXACTF] = compare_mismatch;
     dispatch[ANYOF][EXACTF] = compare_anyof_exactf;
+#ifndef RC_POSIX_NODES
     dispatch[ALNUM][EXACTF] = compare_mismatch;
+    dispatch[ALNUMA][EXACTF] = compare_mismatch;
     dispatch[NALNUM][EXACTF] = compare_mismatch;
+    dispatch[NALNUMA][EXACTF] = compare_mismatch;
     dispatch[SPACE][EXACTF] = compare_mismatch;
+    dispatch[SPACEA][EXACTF] = compare_mismatch;
     dispatch[NSPACE][EXACTF] = compare_mismatch;
+    dispatch[NSPACEA][EXACTF] = compare_mismatch;
     dispatch[DIGIT][EXACTF] = compare_mismatch;
+    dispatch[DIGITA][EXACTF] = compare_mismatch;
     dispatch[NDIGIT][EXACTF] = compare_mismatch;
+    dispatch[NDIGITA][EXACTF] = compare_mismatch;
+#else
+    dispatch[POSIXD][EXACTF] = compare_mismatch;
+    dispatch[POSIXU][EXACTF] = compare_mismatch;
+    dispatch[POSIXA][EXACTF] = compare_mismatch;
+    dispatch[NPOSIXD][EXACTF] = compare_mismatch;
+    dispatch[NPOSIXU][EXACTF] = compare_mismatch;
+    dispatch[NPOSIXA][EXACTF] = compare_mismatch;
+#endif
     dispatch[BRANCH][EXACTF] = compare_left_branch;
     dispatch[EXACT][EXACTF] = compare_exact_exactf;
     dispatch[EXACTF][EXACTF] = compare_exactf_exactf;
@@ -4013,11 +5633,15 @@ void rc_init()
     dispatch[IFMATCH][EXACTF] = compare_after_assertion;
     dispatch[UNLESSM][EXACTF] = compare_after_assertion;
     dispatch[MINMOD][EXACTF] = compare_left_tail;
+#ifndef RC_POSIX_NODES
+    dispatch[VERTWS][EXACTF] = compare_mismatch;
+    dispatch[NVERTWS][EXACTF] = compare_mismatch;
     dispatch[HORIZWS][EXACTF] = compare_mismatch;
     dispatch[NHORIZWS][EXACTF] = compare_mismatch;
+#endif
     dispatch[OPTIMIZED][EXACTF] = compare_left_tail;
 
-    for (i = 0; i < TYPE_COUNT; ++i)
+    for (i = 0; i < REGNODE_MAX; ++i)
     {
         dispatch[i][NOTHING] = compare_next;
     }
@@ -4030,7 +5654,7 @@ void rc_init()
     dispatch[MINMOD][NOTHING] = compare_tails;
     dispatch[OPTIMIZED][NOTHING] = compare_tails;
 
-    for (i = 0; i < TYPE_COUNT; ++i)
+    for (i = 0; i < REGNODE_MAX; ++i)
     {
         dispatch[i][TAIL] = compare_next;
     }
@@ -4043,7 +5667,7 @@ void rc_init()
     dispatch[MINMOD][TAIL] = compare_tails;
     dispatch[OPTIMIZED][TAIL] = compare_tails;
 
-    for (i = 0; i < TYPE_COUNT; ++i)
+    for (i = 0; i < REGNODE_MAX; ++i)
     {
 	dispatch[i][STAR] = compare_right_star;
     }
@@ -4068,7 +5692,7 @@ void rc_init()
     dispatch[MINMOD][STAR] = compare_left_tail;
     dispatch[OPTIMIZED][STAR] = compare_left_tail;
 
-    for (i = 0; i < TYPE_COUNT; ++i)
+    for (i = 0; i < REGNODE_MAX; ++i)
     {
 	dispatch[i][PLUS] = compare_right_plus;
     }
@@ -4088,7 +5712,7 @@ void rc_init()
     dispatch[MINMOD][PLUS] = compare_left_tail;
     dispatch[OPTIMIZED][PLUS] = compare_left_tail;
 
-    for (i = 0; i < TYPE_COUNT; ++i)
+    for (i = 0; i < REGNODE_MAX; ++i)
     {
 	dispatch[i][CURLY] = compare_right_curly;
     }
@@ -4108,7 +5732,7 @@ void rc_init()
     dispatch[MINMOD][CURLY] = compare_left_tail;
     dispatch[OPTIMIZED][CURLY] = compare_left_tail;
 
-    for (i = 0; i < TYPE_COUNT; ++i)
+    for (i = 0; i < REGNODE_MAX; ++i)
     {
 	dispatch[i][CURLYM] = compare_right_curly;
     }
@@ -4128,7 +5752,7 @@ void rc_init()
     dispatch[MINMOD][CURLYM] = compare_left_tail;
     dispatch[OPTIMIZED][CURLYM] = compare_left_tail;
 
-    for (i = 0; i < TYPE_COUNT; ++i)
+    for (i = 0; i < REGNODE_MAX; ++i)
     {
 	dispatch[i][CURLYX] = compare_right_curly;
     }
@@ -4148,7 +5772,7 @@ void rc_init()
     dispatch[MINMOD][CURLYX] = compare_left_tail;
     dispatch[OPTIMIZED][CURLYX] = compare_left_tail;
 
-    for (i = 0; i < TYPE_COUNT; ++i)
+    for (i = 0; i < REGNODE_MAX; ++i)
     {
 	dispatch[i][WHILEM] = compare_next;
     }
@@ -4161,14 +5785,14 @@ void rc_init()
     dispatch[MINMOD][WHILEM] = compare_tails;
     dispatch[OPTIMIZED][WHILEM] = compare_tails;
 
-    for (i = 0; i < TYPE_COUNT; ++i)
+    for (i = 0; i < REGNODE_MAX; ++i)
     {
 	dispatch[i][OPEN] = compare_right_open;
     }
 
     dispatch[OPEN][OPEN] = compare_open_open;
 
-    for (i = 0; i < TYPE_COUNT; ++i)
+    for (i = 0; i < REGNODE_MAX; ++i)
     {
 	dispatch[i][CLOSE] = compare_next;
     }
@@ -4190,12 +5814,27 @@ void rc_init()
     dispatch[REG_ANY][IFMATCH] = compare_mismatch;
     dispatch[SANY][IFMATCH] = compare_mismatch;
     dispatch[ANYOF][IFMATCH] = compare_mismatch;
+#ifndef RC_POSIX_NODES
     dispatch[ALNUM][IFMATCH] = compare_mismatch;
+    dispatch[ALNUMA][IFMATCH] = compare_mismatch;
     dispatch[NALNUM][IFMATCH] = compare_mismatch;
+    dispatch[NALNUMA][IFMATCH] = compare_mismatch;
     dispatch[SPACE][IFMATCH] = compare_mismatch;
+    dispatch[SPACEA][IFMATCH] = compare_mismatch;
     dispatch[NSPACE][IFMATCH] = compare_mismatch;
+    dispatch[NSPACEA][IFMATCH] = compare_mismatch;
     dispatch[DIGIT][IFMATCH] = compare_mismatch;
+    dispatch[DIGITA][IFMATCH] = compare_mismatch;
     dispatch[NDIGIT][IFMATCH] = compare_mismatch;
+    dispatch[NDIGITA][IFMATCH] = compare_mismatch;
+#else
+    dispatch[POSIXD][IFMATCH] = compare_mismatch;
+    dispatch[POSIXU][IFMATCH] = compare_mismatch;
+    dispatch[POSIXA][IFMATCH] = compare_mismatch;
+    dispatch[NPOSIXD][IFMATCH] = compare_mismatch;
+    dispatch[NPOSIXU][IFMATCH] = compare_mismatch;
+    dispatch[NPOSIXA][IFMATCH] = compare_mismatch;
+#endif
     dispatch[BRANCH][IFMATCH] = compare_mismatch;
     dispatch[EXACT][IFMATCH] = compare_mismatch;
     dispatch[EXACTF][IFMATCH] = compare_mismatch;
@@ -4212,8 +5851,12 @@ void rc_init()
     dispatch[IFMATCH][IFMATCH] = compare_positive_assertions;
     dispatch[UNLESSM][IFMATCH] = compare_mismatch;
     dispatch[MINMOD][IFMATCH] = compare_left_tail;
+#ifndef RC_POSIX_NODES
+    dispatch[VERTWS][IFMATCH] = compare_mismatch;
+    dispatch[NVERTWS][IFMATCH] = compare_mismatch;
     dispatch[HORIZWS][IFMATCH] = compare_mismatch;
     dispatch[NHORIZWS][IFMATCH] = compare_mismatch;
+#endif
     dispatch[OPTIMIZED][IFMATCH] = compare_left_tail;
 
     dispatch[SUCCEED][UNLESSM] = compare_left_tail;
@@ -4225,12 +5868,27 @@ void rc_init()
     dispatch[REG_ANY][UNLESSM] = compare_mismatch;
     dispatch[SANY][UNLESSM] = compare_mismatch;
     dispatch[ANYOF][UNLESSM] = compare_mismatch;
+#ifndef RC_POSIX_NODES
     dispatch[ALNUM][UNLESSM] = compare_mismatch;
+    dispatch[ALNUMA][UNLESSM] = compare_mismatch;
     dispatch[NALNUM][UNLESSM] = compare_mismatch;
+    dispatch[NALNUMA][UNLESSM] = compare_mismatch;
     dispatch[SPACE][UNLESSM] = compare_mismatch;
+    dispatch[SPACEA][UNLESSM] = compare_mismatch;
     dispatch[NSPACE][UNLESSM] = compare_mismatch;
+    dispatch[NSPACEA][UNLESSM] = compare_mismatch;
     dispatch[DIGIT][UNLESSM] = compare_mismatch;
+    dispatch[DIGITA][UNLESSM] = compare_mismatch;
     dispatch[NDIGIT][UNLESSM] = compare_mismatch;
+    dispatch[NDIGITA][UNLESSM] = compare_mismatch;
+#else
+    dispatch[POSIXD][UNLESSM] = compare_mismatch;
+    dispatch[POSIXU][UNLESSM] = compare_mismatch;
+    dispatch[POSIXA][UNLESSM] = compare_mismatch;
+    dispatch[NPOSIXD][UNLESSM] = compare_mismatch;
+    dispatch[NPOSIXU][UNLESSM] = compare_mismatch;
+    dispatch[NPOSIXA][UNLESSM] = compare_mismatch;
+#endif
     dispatch[BRANCH][UNLESSM] = compare_mismatch;
     dispatch[EXACT][UNLESSM] = compare_mismatch;
     dispatch[EXACTF][UNLESSM] = compare_mismatch;
@@ -4247,11 +5905,15 @@ void rc_init()
     dispatch[IFMATCH][UNLESSM] = compare_mismatch;
     dispatch[UNLESSM][UNLESSM] = compare_negative_assertions;
     dispatch[MINMOD][UNLESSM] = compare_left_tail;
+#ifndef RC_POSIX_NODES
+    dispatch[VERTWS][UNLESSM] = compare_mismatch;
+    dispatch[NVERTWS][UNLESSM] = compare_mismatch;
     dispatch[HORIZWS][UNLESSM] = compare_mismatch;
     dispatch[NHORIZWS][UNLESSM] = compare_mismatch;
+#endif
     dispatch[OPTIMIZED][UNLESSM] = compare_left_tail;
 
-    for (i = 0; i < TYPE_COUNT; ++i)
+    for (i = 0; i < REGNODE_MAX; ++i)
     {
 	dispatch[i][MINMOD] = compare_next;
     }
@@ -4264,6 +5926,93 @@ void rc_init()
     dispatch[MINMOD][MINMOD] = compare_tails;
     dispatch[OPTIMIZED][MINMOD] = compare_tails;
 
+#ifndef RC_POSIX_NODES
+    dispatch[SUCCEED][VERTWS] = compare_left_tail;
+    dispatch[BOL][VERTWS] = compare_bol;
+    dispatch[MBOL][VERTWS] = compare_bol;
+    dispatch[SBOL][VERTWS] = compare_bol;
+    dispatch[BOUND][VERTWS] = compare_mismatch;
+    dispatch[NBOUND][VERTWS] = compare_mismatch;
+    dispatch[REG_ANY][VERTWS] = compare_mismatch;
+    dispatch[SANY][VERTWS] = compare_mismatch;
+    dispatch[ANYOF][VERTWS] = compare_anyof_vertical_space;
+    dispatch[ALNUM][VERTWS] = compare_mismatch;
+    dispatch[ALNUMA][VERTWS] = compare_mismatch;
+    dispatch[NALNUM][VERTWS] = compare_mismatch;
+    dispatch[NALNUMA][VERTWS] = compare_mismatch;
+    dispatch[SPACE][VERTWS] = compare_mismatch;
+    dispatch[SPACEA][VERTWS] = compare_mismatch;
+    dispatch[NSPACE][VERTWS] = compare_mismatch;
+    dispatch[NSPACEA][VERTWS] = compare_mismatch;
+    dispatch[DIGIT][VERTWS] = compare_mismatch;
+    dispatch[DIGITA][VERTWS] = compare_mismatch;
+    dispatch[NDIGIT][VERTWS] = compare_mismatch;
+    dispatch[NDIGITA][VERTWS] = compare_mismatch;
+    dispatch[BRANCH][VERTWS] = compare_left_branch;
+    dispatch[EXACT][VERTWS] = compare_exact_vertical_space;
+    dispatch[EXACTF][VERTWS] = compare_exact_vertical_space;
+    dispatch[NOTHING][VERTWS] = compare_left_tail;
+    dispatch[TAIL][VERTWS] = compare_left_tail;
+    dispatch[STAR][VERTWS] = compare_mismatch;
+    dispatch[PLUS][VERTWS] = compare_left_plus;
+    dispatch[CURLY][VERTWS] = compare_left_curly;
+    dispatch[CURLYM][VERTWS] = compare_left_curly;
+    dispatch[CURLYX][VERTWS] = compare_left_curly;
+    dispatch[WHILEM][VERTWS] = compare_left_tail;
+    dispatch[OPEN][VERTWS] = compare_left_open;
+    dispatch[CLOSE][VERTWS] = compare_left_tail;
+    dispatch[IFMATCH][VERTWS] = compare_after_assertion;
+    dispatch[UNLESSM][VERTWS] = compare_after_assertion;
+    dispatch[MINMOD][VERTWS] = compare_left_tail;
+    dispatch[VERTWS][VERTWS] = compare_tails;
+    dispatch[NVERTWS][VERTWS] = compare_mismatch;
+    dispatch[HORIZWS][VERTWS] = compare_mismatch;
+    dispatch[NHORIZWS][VERTWS] = compare_mismatch;
+    dispatch[OPTIMIZED][VERTWS] = compare_left_tail;
+
+    dispatch[SUCCEED][NVERTWS] = compare_left_tail;
+    dispatch[BOL][NVERTWS] = compare_bol;
+    dispatch[MBOL][NVERTWS] = compare_bol;
+    dispatch[SBOL][NVERTWS] = compare_bol;
+    dispatch[BOUND][NVERTWS] = compare_mismatch;
+    dispatch[NBOUND][NVERTWS] = compare_mismatch;
+    dispatch[REG_ANY][NVERTWS] = compare_mismatch;
+    dispatch[SANY][NVERTWS] = compare_mismatch;
+    dispatch[ANYOF][NVERTWS] = compare_anyof_negative_vertical_space;
+    dispatch[ALNUM][NVERTWS] = compare_tails;
+    dispatch[ALNUMA][NVERTWS] = compare_tails;
+    dispatch[NALNUM][NVERTWS] = compare_mismatch;
+    dispatch[NALNUMA][NVERTWS] = compare_mismatch;
+    dispatch[SPACE][NVERTWS] = compare_mismatch;
+    dispatch[SPACEA][NVERTWS] = compare_mismatch;
+    dispatch[NSPACE][NVERTWS] = compare_mismatch;
+    dispatch[NSPACEA][NVERTWS] = compare_mismatch;
+    dispatch[DIGIT][NVERTWS] = compare_tails;
+    dispatch[DIGITA][NVERTWS] = compare_tails;
+    dispatch[NDIGIT][NVERTWS] = compare_mismatch;
+    dispatch[NDIGITA][NVERTWS] = compare_mismatch;
+    dispatch[BRANCH][NVERTWS] = compare_left_branch;
+    dispatch[EXACT][NVERTWS] = compare_exact_negative_vertical_space;
+    dispatch[EXACTF][NVERTWS] = compare_exact_negative_vertical_space;
+    dispatch[NOTHING][NVERTWS] = compare_left_tail;
+    dispatch[TAIL][NVERTWS] = compare_left_tail;
+    dispatch[STAR][NVERTWS] = compare_mismatch;
+    dispatch[PLUS][NVERTWS] = compare_left_plus;
+    dispatch[CURLY][NVERTWS] = compare_left_curly;
+    dispatch[CURLYM][NVERTWS] = compare_left_curly;
+    dispatch[CURLYX][NVERTWS] = compare_left_curly;
+    dispatch[WHILEM][NVERTWS] = compare_left_tail;
+    dispatch[OPEN][NVERTWS] = compare_left_open;
+    dispatch[CLOSE][NVERTWS] = compare_left_tail;
+    dispatch[IFMATCH][NVERTWS] = compare_after_assertion;
+    dispatch[UNLESSM][NVERTWS] = compare_after_assertion;
+    dispatch[MINMOD][NVERTWS] = compare_left_tail;
+    dispatch[VERTWS][NVERTWS] = compare_mismatch;
+    dispatch[NVERTWS][NVERTWS] = compare_tails;
+    dispatch[HORIZWS][NVERTWS] = compare_mismatch;
+    dispatch[NHORIZWS][NVERTWS] = compare_mismatch;
+    dispatch[OPTIMIZED][NVERTWS] = compare_left_tail;
+
     dispatch[SUCCEED][HORIZWS] = compare_left_tail;
     dispatch[BOL][HORIZWS] = compare_bol;
     dispatch[MBOL][HORIZWS] = compare_bol;
@@ -4274,14 +6023,21 @@ void rc_init()
     dispatch[SANY][HORIZWS] = compare_mismatch;
     dispatch[ANYOF][HORIZWS] = compare_anyof_horizontal_space;
     dispatch[ALNUM][HORIZWS] = compare_mismatch;
+    dispatch[ALNUMA][HORIZWS] = compare_mismatch;
     dispatch[NALNUM][HORIZWS] = compare_mismatch;
+    dispatch[NALNUMA][HORIZWS] = compare_mismatch;
     dispatch[SPACE][HORIZWS] = compare_mismatch;
+    dispatch[SPACEA][HORIZWS] = compare_mismatch;
     dispatch[NSPACE][HORIZWS] = compare_mismatch;
+    dispatch[NSPACEA][HORIZWS] = compare_mismatch;
     dispatch[DIGIT][HORIZWS] = compare_mismatch;
+    dispatch[DIGITA][HORIZWS] = compare_mismatch;
     dispatch[NDIGIT][HORIZWS] = compare_mismatch;
+    dispatch[NDIGITA][HORIZWS] = compare_mismatch;
     dispatch[BRANCH][HORIZWS] = compare_left_branch;
     dispatch[EXACT][HORIZWS] = compare_exact_horizontal_space;
     dispatch[EXACTF][HORIZWS] = compare_exact_horizontal_space;
+    dispatch[NOTHING][HORIZWS] = compare_left_tail;
     dispatch[TAIL][HORIZWS] = compare_left_tail;
     dispatch[STAR][HORIZWS] = compare_mismatch;
     dispatch[PLUS][HORIZWS] = compare_left_plus;
@@ -4294,6 +6050,8 @@ void rc_init()
     dispatch[IFMATCH][HORIZWS] = compare_after_assertion;
     dispatch[UNLESSM][HORIZWS] = compare_after_assertion;
     dispatch[MINMOD][HORIZWS] = compare_left_tail;
+    dispatch[VERTWS][HORIZWS] = compare_mismatch;
+    dispatch[NVERTWS][HORIZWS] = compare_mismatch;
     dispatch[HORIZWS][HORIZWS] = compare_tails;
     dispatch[NHORIZWS][HORIZWS] = compare_mismatch;
     dispatch[OPTIMIZED][HORIZWS] = compare_left_tail;
@@ -4308,11 +6066,17 @@ void rc_init()
     dispatch[SANY][NHORIZWS] = compare_mismatch;
     dispatch[ANYOF][NHORIZWS] = compare_anyof_negative_horizontal_space;
     dispatch[ALNUM][NHORIZWS] = compare_tails;
+    dispatch[ALNUMA][NHORIZWS] = compare_tails;
     dispatch[NALNUM][NHORIZWS] = compare_mismatch;
+    dispatch[NALNUMA][NHORIZWS] = compare_mismatch;
     dispatch[SPACE][NHORIZWS] = compare_mismatch;
+    dispatch[SPACEA][NHORIZWS] = compare_mismatch;
     dispatch[NSPACE][NHORIZWS] = compare_tails;
+    dispatch[NSPACEA][NHORIZWS] = compare_mismatch;
     dispatch[DIGIT][NHORIZWS] = compare_tails;
+    dispatch[DIGITA][NHORIZWS] = compare_tails;
     dispatch[NDIGIT][NHORIZWS] = compare_mismatch;
+    dispatch[NDIGITA][NHORIZWS] = compare_mismatch;
     dispatch[BRANCH][NHORIZWS] = compare_left_branch;
     dispatch[EXACT][NHORIZWS] = compare_exact_negative_horizontal_space;
     dispatch[EXACTF][NHORIZWS] = compare_exact_negative_horizontal_space;
@@ -4329,11 +6093,14 @@ void rc_init()
     dispatch[IFMATCH][NHORIZWS] = compare_after_assertion;
     dispatch[UNLESSM][NHORIZWS] = compare_after_assertion;
     dispatch[MINMOD][NHORIZWS] = compare_left_tail;
+    dispatch[VERTWS][NHORIZWS] = compare_mismatch;
+    dispatch[NVERTWS][NHORIZWS] = compare_mismatch;
     dispatch[HORIZWS][NHORIZWS] = compare_mismatch;
     dispatch[NHORIZWS][NHORIZWS] = compare_tails;
     dispatch[OPTIMIZED][NHORIZWS] = compare_left_tail;
+#endif
 
-    for (i = 0; i < TYPE_COUNT; ++i)
+    for (i = 0; i < REGNODE_MAX; ++i)
     {
 	dispatch[i][OPTIMIZED] = compare_next;
     }

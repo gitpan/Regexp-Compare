@@ -9,4 +9,3 @@ README
 t/Regexp-Compare.t
 lib/Regexp/Compare.pm
 META.yml                                 Module meta-data (added by MakeMaker)
-META.json                                Module JSON meta-data (added by MakeMaker)
