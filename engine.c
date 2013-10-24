@@ -5372,8 +5372,11 @@ void rc_init()
     dispatch[REG_ANY][POSIXU] = compare_mismatch;
     dispatch[SANY][POSIXU] = compare_mismatch;
     dispatch[POSIXD][POSIXU] = compare_posix_posix;
+    dispatch[POSIXA][POSIXU] = compare_mismatch;
     dispatch[POSIXU][POSIXU] = compare_posix_posix;
+    dispatch[NPOSIXD][POSIXU] = compare_mismatch;
     dispatch[NPOSIXU][POSIXU] = compare_mismatch;
+    dispatch[NPOSIXA][POSIXU] = compare_mismatch;
     dispatch[BRANCH][POSIXU] = compare_left_branch;
     dispatch[EXACT][POSIXU] = compare_exact_posix;
     dispatch[EXACTF][POSIXU] = compare_exact_posix;

@@ -78,3 +78,5 @@ Revision history for Perl extension Regexp::Compare.
 	- requiring at least perl 5.14, supporting perl 5.18.x
 	- partial support for /a modifier
 
+0.22  Thu Oct 24 14:42:18 UTC 2013
+	- fixed for perl 5.18.x
